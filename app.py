@@ -94,7 +94,6 @@ async def get_web_client():
     return web_client
 
 def resolve_clean_model(client, model_code: str):
-    """Берёт только оригинальный нетронутый объект модели из сессии Google, чтобы не было Stream incomplete"""
     code = model_code.lower()
     if hasattr(client, "list_models"):
         try:
@@ -124,6 +123,13 @@ def resolve_clean_model(client, model_code: str):
 async def safe_send(message: types.Message, text: str):
     if not text:
         return
+
+    # Срезаем технические якоря картинок от сайта (вроде _869 и внутренних ссылок)
+    text = re.sub(r"https?://googleusercontent\.com/\S+", "", text)
+    text = re.sub(r"(?:^|\s)_[0-9]+\b", "", text).strip()
+    if not text:
+        return
+
     if "SEND_FILE:" in text:
         after_tag = text.split("SEND_FILE:", 1)[1].strip()
         lines = after_tag.split("\n", 1)
@@ -229,8 +235,6 @@ async def ask_gemini_fallback(user_id: int, new_content, history_text: str):
                 last_err = e
                 continue
     raise Exception(f"Запасные ключи не сработали: {last_err}")
-
-# ================= ДИСПЕТЧЕР =================
 
 def create_dispatcher(bot_inst: Bot):
     d = Dispatcher()
@@ -372,7 +376,7 @@ def create_dispatcher(bot_inst: Bot):
     return d
 
 @st.cache_resource
-def launch_bot_v10():
+def launch_bot_v11():
     old_state = getattr(sys, "_active_tg_bot", None)
     if old_state:
         old_loop, old_dp = old_state
@@ -406,7 +410,7 @@ def launch_bot_v10():
     t.start()
     return t
 
-launch_bot_v10()
+launch_bot_v11()
 
 st.title("Gemini Bot")
 st.success("Активен")

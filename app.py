@@ -72,6 +72,7 @@ async def start_cmd(message: types.Message):
         "• Можешь кидать фотографии задач — я всё решу без непонятных знаков и кода!"
     )
 
+# 1. ОБРАБОТКА ТЕКСТА
 @dp.message(F.text)
 async def handle_text(message: types.Message):
     await bot.send_chat_action(chat_id=message.chat.id, action="typing")
@@ -83,6 +84,7 @@ async def handle_text(message: types.Message):
     except Exception as e:
         await message.answer(f"⚠️ Ошибка: {e}")
 
+# 2. ОБРАБОТКА ФОТО
 @dp.message(F.photo)
 async def handle_photo(message: types.Message):
     await bot.send_chat_action(chat_id=message.chat.id, action="typing")
@@ -102,19 +104,23 @@ async def handle_photo(message: types.Message):
     except Exception as e:
         await message.answer(f"⚠️ Ошибка при обработке фото: {e}")
 
-# Запуск телеграм-бота ровно один раз в фоновом потоке
+# Асинхронный запуск без перехвата системных сигналов
+async def start_aiogram():
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot, handle_signals=False)
+
 @st.cache_resource
 def start_bot_background():
     def run_polling():
-        asyncio.run(dp.start_polling(bot))
+        asyncio.run(start_aiogram())
 
     t = threading.Thread(target=run_polling, daemon=True)
     t.start()
     return t
 
+# Включаем бота
 start_bot_background()
 
-# Интерфейс для страницы Streamlit
+# Страница Streamlit
 st.title("🤖 Telegram Gemini Bot")
-st.success("✅ Бот успешно запущен в облаке и работает 24/7!")
-st.info("Теперь компьютер можно выключать — бот отвечает прямо из дата-центра.")
+st.success("✅ Бот успешно запущен в облаке и слушает Telegram!")

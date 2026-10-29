@@ -2,10 +2,7 @@ import os
 import sys
 import io
 import re
-import json
-import uuid
 import time
-import copy
 import subprocess
 import asyncio
 import threading
@@ -37,10 +34,10 @@ SECURE_1PSIDTS = get_secret("SECURE_1PSIDTS", "")
 GEMINI_KEYS = list(get_secret("GEMINI_KEYS", []))
 
 MODELS_LIST = [
-    ("3.5 Flash-Lite", "3.5 Flash-Lite"),
-    ("3.8 Flash", "3.8 Flash"),
-    ("3.1 Pro", "3.1 Pro"),
-    ("4 Argon", "4 Argon"),
+    ("3.5 Flash-Lite", "flash-lite"),
+    ("3.8 Flash", "flash"),
+    ("3.1 Pro", "pro"),
+    ("4 Argon", "argon"),
 ]
 
 REASONING_LIST = [
@@ -59,13 +56,6 @@ TOOLS_LIST = [
     ("📖 Обучение", "learning"),
 ]
 
-# Внутренние аппаратные хэши моделей веб-интерфейса Gemini (из протокола Google)
-WEB_MODEL_HASHES = {
-    "3.5 Flash-Lite": ("8c46e95b1a07cecc", 6),
-    "3.8 Flash": ("56fdd199312815e2", 1),
-    "3.1 Pro": ("e6fa609c3fa255c0", 3),
-}
-
 web_client = None
 web_init_lock = asyncio.Lock()
 web_chats = {}
@@ -76,8 +66,9 @@ working_api_key = None
 def get_prefs(uid: int):
     if uid not in user_prefs:
         user_prefs[uid] = {
-            "model": "3.8 Flash",  # Быстрая модель по умолчанию (отвечает за 2-3 сек)
-            "reasoning": "low",    # Низкий уровень рассуждений по умолчанию (без долгих зависаний)
+            "model": "flash",
+            "model_label": "3.8 Flash",
+            "reasoning": "low",
             "tool": "none",
         }
     return user_prefs[uid]
@@ -102,70 +93,32 @@ async def get_web_client():
             web_client = client
     return web_client
 
-def build_web_model(client, wanted_name: str, reasoning_level: str):
-    """Подбирает реальную модель аккаунта и модифицирует аппаратный заголовок x-goog-ext-525001261-jspb"""
-    w = wanted_name.lower()
-    r_slot = 1 if reasoning_level == "low" else 2  # Слот 15 в заголовке Google отвечает за глубину мышления
-
-    matched_model = None
+def resolve_clean_model(client, model_code: str):
+    """Берёт только оригинальный нетронутый объект модели из сессии Google, чтобы не было Stream incomplete"""
+    code = model_code.lower()
     if hasattr(client, "list_models"):
         try:
             models = client.list_models() or []
-            # Точный порядок проверки: сначала lite, потом argon, потом pro, потом flash
             for m in models:
                 d_name = str(getattr(m, "display_name", "")).lower()
                 m_name = str(getattr(m, "model_name", "")).lower()
-                hdr = str(getattr(m, "model_header", "")).lower()
-                if "lite" in w and ("lite" in d_name or "lite" in m_name or "8c46e95b1a07cecc" in hdr):
-                    matched_model = m
-                    break
-                elif "argon" in w and ("argon" in d_name or "argon" in m_name or "4" in d_name):
-                    matched_model = m
-                    break
-                elif "pro" in w and ("pro" in d_name or "pro" in m_name or "e6fa609c3fa255c0" in hdr):
-                    matched_model = m
-                    break
-                elif "flash" in w and "lite" not in w and ("flash" in d_name or "flash" in m_name or "56fdd199312815e2" in hdr) and "lite" not in m_name:
-                    matched_model = m
-                    break
+                if code == "flash-lite" and "lite" in (d_name + m_name):
+                    return m
+                if code == "argon" and ("argon" in (d_name + m_name) or "4" in d_name):
+                    return m
+                if code == "pro" and "pro" in (d_name + m_name):
+                    return m
+                if code == "flash" and "flash" in (d_name + m_name) and "lite" not in (d_name + m_name):
+                    return m
         except Exception:
             pass
 
-    if matched_model is None and hasattr(client, "resolve_model"):
-        try:
-            if "lite" in w:
-                matched_model = client.resolve_model("flash-lite")
-            elif "pro" in w or "argon" in w:
-                matched_model = client.resolve_model("pro")
-            else:
-                matched_model = client.resolve_model("flash")
-        except Exception:
-            pass
-
-    # Модифицируем аппаратный заголовок x-goog-ext-525001261-jspb под выбранный уровень рассуждений
-    if matched_model is not None:
-        try:
-            m_copy = copy.deepcopy(matched_model)
-            hdr_dict = getattr(m_copy, "model_header", None)
-            if isinstance(hdr_dict, dict) and "x-goog-ext-525001261-jspb" in hdr_dict:
-                arr = json.loads(hdr_dict["x-goog-ext-525001261-jspb"])
-                if isinstance(arr, list) and len(arr) > 15:
-                    arr[15] = r_slot
-                    hdr_dict["x-goog-ext-525001261-jspb"] = json.dumps(arr, separators=(",", ":"))
-            return m_copy
-        except Exception:
-            return matched_model
-
-    # Если модель не нашлась в list_models — собираем прямой аппаратный заголовок по хэшу
-    if wanted_name in WEB_MODEL_HASHES:
-        m_hash, cat = WEB_MODEL_HASHES[wanted_name]
-        req_uuid = str(uuid.uuid4()).upper()
-        jspb = f'[1,null,null,null,"{m_hash}",null,null,0,[4,5,6,8],null,null,2,null,null,{cat},{r_slot},"{req_uuid}"]'
-        return {
-            "model_name": wanted_name,
-            "model_header": {"x-goog-ext-525001261-jspb": jspb}
-        }
-
+    if hasattr(client, "resolve_model"):
+        for candidate in ([code, "pro"] if code == "argon" else [code]):
+            try:
+                return client.resolve_model(candidate)
+            except Exception:
+                continue
     return None
 
 async def safe_send(message: types.Message, text: str):
@@ -195,13 +148,10 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
     uid = message.from_user.id
     prefs = get_prefs(uid)
 
-    target_model = build_web_model(client, prefs["model"], prefs["reasoning"])
+    target_model = resolve_clean_model(client, prefs["model"])
 
     if uid not in web_chats:
-        try:
-            web_chats[uid] = client.start_chat(model=target_model) if target_model else client.start_chat()
-        except Exception:
-            web_chats[uid] = client.start_chat()
+        web_chats[uid] = client.start_chat(model=target_model) if target_model else client.start_chat()
     else:
         old_chat = web_chats[uid]
         if target_model:
@@ -213,13 +163,6 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
     chat = web_chats[uid]
     tool = prefs["tool"]
 
-    # Отправляем чистый запрос (без мусорных приписок в чате)
-    send_kwargs = {}
-    if file_path:
-        send_kwargs["files"] = [file_path]
-    if tool == "deep_research":
-        send_kwargs["deep_research"] = True
-
     clean_prompt = prompt
     if tool == "image":
         clean_prompt = f"Создай или отредактируй изображение: {prompt}"
@@ -228,11 +171,8 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
     elif tool == "music":
         clean_prompt = f"Создай музыку: {prompt}"
 
-    try:
-        response = await chat.send_message(clean_prompt, **send_kwargs)
-    except TypeError:
-        # На случай если версия gemini-webapi не принимает флаг deep_research
-        response = await chat.send_message(clean_prompt, files=[file_path] if file_path else None)
+    files = [file_path] if file_path else None
+    response = await asyncio.wait_for(chat.send_message(clean_prompt, files=files), timeout=45)
 
     if getattr(response, "images", None):
         await bot_inst.send_chat_action(chat_id=message.chat.id, action="upload_photo")
@@ -257,13 +197,7 @@ async def ask_gemini_fallback(user_id: int, new_content, history_text: str):
     full_contents = list(history) + [new_content]
     prefs = get_prefs(user_id)
 
-    # Ставим быструю модель первой, если выбрана 3.5, иначе 3.8
-    if "3.5" in prefs["model"]:
-        api_models = ["gemini-3.5-flash-lite", "gemini-3.8-flash"]
-    else:
-        api_models = ["gemini-3.8-flash", "gemini-3.5-flash-lite"]
-
-    # Сначала пробуем уже проверенный рабочий ключ, чтобы не тратить время на мертвые
+    api_models = ["gemini-3.5-flash-lite", "gemini-3.8-flash"] if prefs["model"] == "flash-lite" else ["gemini-3.8-flash", "gemini-3.5-flash-lite"]
     keys_to_try = ([working_api_key] + [k for k in GEMINI_KEYS if k != working_api_key]) if working_api_key else GEMINI_KEYS
 
     last_err = None
@@ -294,7 +228,7 @@ async def ask_gemini_fallback(user_id: int, new_content, history_text: str):
             except Exception as e:
                 last_err = e
                 continue
-    raise Exception(f"Запасные ключи тоже не сработали: {last_err}")
+    raise Exception(f"Запасные ключи не сработали: {last_err}")
 
 # ================= ДИСПЕТЧЕР =================
 
@@ -308,7 +242,7 @@ def create_dispatcher(bot_inst: Bot):
         prefs = get_prefs(uid)
         r_label = dict((v, k) for k, v in REASONING_LIST).get(prefs["reasoning"], prefs["reasoning"])
         await message.answer(
-            f"Модель: *{prefs['model']}*\n"
+            f"Модель: *{prefs['model_label']}*\n"
             f"Уровень рассуждений: *{r_label}*",
             parse_mode="Markdown",
             reply_markup=get_main_reply_kb()
@@ -327,16 +261,18 @@ def create_dispatcher(bot_inst: Bot):
         kb = InlineKeyboardBuilder()
         for label, code in MODELS_LIST:
             mark = "✓ " if cur == code else ""
-            kb.button(text=f"{mark}{label}", callback_data=f"model:{code}")
+            kb.button(text=f"{mark}{label}", callback_data=f"model:{code}:{label}")
         kb.adjust(1)
         await message.answer("Модель:", reply_markup=kb.as_markup())
 
     @d.callback_query(F.data.startswith("model:"))
     async def cb_model(call: types.CallbackQuery):
-        code = call.data.split(":", 1)[1]
-        get_prefs(call.from_user.id)["model"] = code
+        _, code, label = call.data.split(":", 2)
+        prefs = get_prefs(call.from_user.id)
+        prefs["model"] = code
+        prefs["model_label"] = label
         await call.answer()
-        await call.message.edit_text(f"Модель: *{code}*", parse_mode="Markdown")
+        await call.message.edit_text(f"Модель: *{label}*", parse_mode="Markdown")
 
     @d.message(F.text == "Уровень рассуждений")
     async def menu_reasoning(message: types.Message):
@@ -382,10 +318,10 @@ def create_dispatcher(bot_inst: Bot):
         except Exception as web_err:
             try:
                 ans, used_model = await ask_gemini_fallback(message.from_user.id, message.text, message.text)
-                warn = f"⚠️ [Сработал запасной API ({used_model}) | Причина веб-сбоя: {web_err}]\n\n"
+                warn = f"⚠️ [Запасной API ({used_model}) | Веб: {web_err}]\n\n"
                 await safe_send(message, warn + ans)
             except Exception as e:
-                await message.answer(f"Ошибка (и веб, и запаска): {e}", reply_markup=get_main_reply_kb())
+                await message.answer(f"Ошибка: {e}", reply_markup=get_main_reply_kb())
 
     @d.message(F.photo)
     async def handle_photo(message: types.Message):
@@ -406,7 +342,7 @@ def create_dispatcher(bot_inst: Bot):
                 image = Image.open(file_io)
                 image.load()
                 ans, used_model = await ask_gemini_fallback(message.from_user.id, [caption, image], f"[Фото] {caption}")
-                warn = f"⚠️ [Сработал запасной API ({used_model}) | Причина веб-сбоя: {web_err}]\n\n"
+                warn = f"⚠️ [Запасной API ({used_model}) | Веб: {web_err}]\n\n"
                 await safe_send(message, warn + ans)
         except Exception as e:
             await message.answer(f"Ошибка: {e}", reply_markup=get_main_reply_kb())
@@ -436,7 +372,7 @@ def create_dispatcher(bot_inst: Bot):
     return d
 
 @st.cache_resource
-def launch_bot_v9():
+def launch_bot_v10():
     old_state = getattr(sys, "_active_tg_bot", None)
     if old_state:
         old_loop, old_dp = old_state
@@ -470,7 +406,7 @@ def launch_bot_v9():
     t.start()
     return t
 
-launch_bot_v9()
+launch_bot_v10()
 
 st.title("Gemini Bot")
 st.success("Активен")

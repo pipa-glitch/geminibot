@@ -2,6 +2,7 @@ import os
 import sys
 import io
 import re
+import json
 import time
 import subprocess
 import asyncio
@@ -32,6 +33,46 @@ TELEGRAM_TOKEN = get_secret("TELEGRAM_TOKEN", "9099534534:AAExrwposBIWvrkBZKbN32
 SECURE_1PSID = get_secret("SECURE_1PSID", "")
 SECURE_1PSIDTS = get_secret("SECURE_1PSIDTS", "")
 GEMINI_KEYS = list(get_secret("GEMINI_KEYS", []))
+MASTER_PIN = str(get_secret("MASTER_PIN", "322"))
+
+ACCESS_FILE = "access_db.json"
+
+def load_access_db():
+    if os.path.exists(ACCESS_FILE):
+        try:
+            with open(ACCESS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"admin_id": None, "users": {}}
+
+def save_access_db(db):
+    try:
+        with open(ACCESS_FILE, "w", encoding="utf-8") as f:
+            json.dump(db, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+access_db = load_access_db()
+
+def is_admin(uid: int) -> bool:
+    return access_db.get("admin_id") == uid
+
+def check_access(uid: int) -> bool:
+    if is_admin(uid):
+        return True
+    u_info = access_db.get("users", {}).get(str(uid))
+    if not u_info:
+        return False
+    exp = u_info.get("expires_at", 0)
+    if exp == 0:  # 0 = Навсегда
+        return True
+    if time.time() < exp:
+        return True
+    # Срок вышел — удаляем
+    access_db["users"].pop(str(uid), None)
+    save_access_db(access_db)
+    return False
 
 MODELS_LIST = [
     ("3.5 Flash-Lite", "flash-lite"),
@@ -73,14 +114,23 @@ def get_prefs(uid: int):
         }
     return user_prefs[uid]
 
-def get_main_reply_kb():
+def get_main_reply_kb(uid: int = 0):
     kb = ReplyKeyboardBuilder()
     kb.button(text="Модель")
     kb.button(text="Уровень рассуждений")
     kb.button(text="Инструменты")
     kb.button(text="Новый чат")
-    kb.adjust(2, 2)
+    if is_admin(uid):
+        kb.button(text="👑 Админка")
+        kb.adjust(2, 2, 1)
+    else:
+        kb.adjust(2, 2)
     return kb.as_markup(resize_keyboard=True)
+
+def get_locked_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📩 Запросить доступ", callback_data="req_access")
+    return kb.as_markup()
 
 async def get_web_client():
     global web_client
@@ -123,8 +173,8 @@ def resolve_clean_model(client, model_code: str):
 async def safe_send(message: types.Message, text: str):
     if not text:
         return
+    uid = message.from_user.id
 
-    # Срезаем технические якоря картинок от сайта (вроде _869 и внутренних ссылок)
     text = re.sub(r"https?://googleusercontent\.com/\S+", "", text)
     text = re.sub(r"(?:^|\s)_[0-9]+\b", "", text).strip()
     if not text:
@@ -138,16 +188,16 @@ async def safe_send(message: types.Message, text: str):
         file_content = re.sub(r"^```[a-zA-Z0-9_-]*\n", "", file_content.strip())
         file_content = re.sub(r"\n```$", "", file_content.strip())
         doc = types.BufferedInputFile(file_content.encode("utf-8"), filename=filename)
-        await message.answer_document(doc, reply_markup=get_main_reply_kb())
+        await message.answer_document(doc, reply_markup=get_main_reply_kb(uid))
         return
 
     max_len = 4000
     for i in range(0, len(text), max_len):
         part = text[i:i + max_len]
         try:
-            await message.answer(part, parse_mode="Markdown", reply_markup=get_main_reply_kb())
+            await message.answer(part, parse_mode="Markdown", reply_markup=get_main_reply_kb(uid))
         except Exception:
-            await message.answer(part, parse_mode=None, reply_markup=get_main_reply_kb())
+            await message.answer(part, parse_mode=None, reply_markup=get_main_reply_kb(uid))
 
 async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, file_path: str = None):
     client = await get_web_client()
@@ -189,7 +239,7 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
             if os.path.exists(out_path):
                 with open(out_path, "rb") as f:
                     photo_file = types.BufferedInputFile(f.read(), filename=out_name)
-                    await message.answer_photo(photo_file, reply_markup=get_main_reply_kb())
+                    await message.answer_photo(photo_file, reply_markup=get_main_reply_kb(uid))
                 os.remove(out_path)
 
     if getattr(response, "text", None):
@@ -239,9 +289,32 @@ async def ask_gemini_fallback(user_id: int, new_content, history_text: str):
 def create_dispatcher(bot_inst: Bot):
     d = Dispatcher()
 
+    # Секретная команда активации Владельца: /owner 322
+    @d.message(Command("owner"))
+    async def claim_owner(message: types.Message):
+        parts = message.text.split()
+        if len(parts) > 1 and parts[1].strip() == MASTER_PIN:
+            access_db["admin_id"] = message.from_user.id
+            save_access_db(access_db)
+            await message.answer(
+                "👑 **Ты назначен Главным Владельцем бота!**\n"
+                "Теперь у тебя есть кнопка «👑 Админка», а все посторонние заблокированы.",
+                parse_mode="Markdown",
+                reply_markup=get_main_reply_kb(message.from_user.id)
+            )
+
     @d.message(CommandStart())
     async def start_cmd(message: types.Message):
         uid = message.from_user.id
+        if not check_access(uid):
+            await message.answer(
+                "🔒 **Доступ к этому боту закрыт.**\n\n"
+                "Нажми кнопку ниже, чтобы отправить заявку владельцу:",
+                parse_mode="Markdown",
+                reply_markup=get_locked_kb()
+            )
+            return
+
         web_chats.pop(uid, None)
         prefs = get_prefs(uid)
         r_label = dict((v, k) for k, v in REASONING_LIST).get(prefs["reasoning"], prefs["reasoning"])
@@ -249,18 +322,144 @@ def create_dispatcher(bot_inst: Bot):
             f"Модель: *{prefs['model_label']}*\n"
             f"Уровень рассуждений: *{r_label}*",
             parse_mode="Markdown",
-            reply_markup=get_main_reply_kb()
+            reply_markup=get_main_reply_kb(uid)
         )
 
+    # Заявка на доступ от нового человека
+    @d.callback_query(F.data == "req_access")
+    async def cb_req_access(call: types.CallbackQuery):
+        uid = call.from_user.id
+        if check_access(uid):
+            await call.answer("У тебя уже есть доступ!")
+            return
+
+        admin_id = access_db.get("admin_id")
+        if not admin_id:
+            await call.answer("Владелец ещё не активировал админку (/owner 322).", show_alert=True)
+            return
+
+        u_name = call.from_user.full_name or "Без имени"
+        u_nick = f"@{call.from_user.username}" if call.from_user.username else "без юзернейма"
+
+        kb = InlineKeyboardBuilder()
+        kb.button(text="⏱ На 1 час (Урок)", callback_data=f"grant:{uid}:3600")
+        kb.button(text="📅 На 1 день (24ч)", callback_data=f"grant:{uid}:86400")
+        kb.button(text="♾ Навсегда", callback_data=f"grant:{uid}:0")
+        kb.button(text="❌ Отказать", callback_data=f"deny:{uid}")
+        kb.adjust(2, 1, 1)
+
+        await bot_inst.send_message(
+            admin_id,
+            f"🔔 **Заявка на доступ!**\n"
+            f"👤 Имя: {u_name} ({u_nick})\n"
+            f"🆔 ID: `{uid}`",
+            parse_mode="Markdown",
+            reply_markup=kb.as_markup()
+        )
+        await call.answer("Заявка отправлена владельцу!")
+        await call.message.edit_text("⏳ **Заявка отправлена!** Ожидай подтверждения от владельца.", parse_mode="Markdown")
+
+    # Выдача доступа админом
+    @d.callback_query(F.data.startswith("grant:"))
+    async def cb_grant(call: types.CallbackQuery):
+        if not is_admin(call.from_user.id):
+            return
+        _, target_uid_str, seconds_str = call.data.split(":")
+        seconds = int(seconds_str)
+        expires_at = (time.time() + seconds) if seconds > 0 else 0
+
+        try:
+            chat_info = await bot_inst.get_chat(int(target_uid_str))
+            name_label = f"{chat_info.full_name} (@{chat_info.username})" if chat_info.username else chat_info.full_name
+        except Exception:
+            name_label = f"User {target_uid_str}"
+
+        access_db.setdefault("users", {})[target_uid_str] = {
+            "name": name_label,
+            "expires_at": expires_at,
+        }
+        save_access_db(access_db)
+
+        period_text = "на 1 час" if seconds == 3600 else ("на 24 часа" if seconds == 86400 else "навсегда")
+        await call.answer("Доступ выдан!")
+        await call.message.edit_text(f"✅ Доступ для **{name_label}** (`{target_uid_str}`) открыт **{period_text}**!", parse_mode="Markdown")
+
+        try:
+            await bot_inst.send_message(
+                int(target_uid_str),
+                f"🎉 **Тебе открыт доступ к боту ({period_text})!**\nМожешь писать вопросы или скидывать фото задач 👇",
+                parse_mode="Markdown",
+                reply_markup=get_main_reply_kb(int(target_uid_str))
+            )
+        except Exception:
+            pass
+
+    @d.callback_query(F.data.startswith("deny:"))
+    async def cb_deny(call: types.CallbackQuery):
+        if not is_admin(call.from_user.id):
+            return
+        target_uid = int(call.data.split(":")[1])
+        await call.answer("Отклонено")
+        await call.message.edit_text(f"❌ Заявка `{target_uid}` отклонена.", parse_mode="Markdown")
+        try:
+            await bot_inst.send_message(target_uid, "❌ Владелец отклонил заявку на доступ.")
+        except Exception:
+            pass
+
+    # Панель управления клиентами
+    @d.message(F.text == "👑 Админка")
+    async def admin_panel(message: types.Message):
+        if not is_admin(message.from_user.id):
+            return
+        users = access_db.get("users", {})
+        if not users:
+            await message.answer("👑 **Админ-панель**\n\nСейчас активных клиентов нет.", parse_mode="Markdown")
+            return
+
+        kb = InlineKeyboardBuilder()
+        lines = ["👑 **Активные пользователи:**\n"]
+        now = time.time()
+        for uid_str, info in list(users.items()):
+            exp = info.get("expires_at", 0)
+            if exp != 0 and now >= exp:
+                users.pop(uid_str, None)
+                continue
+            rem = "♾ Навсегда" if exp == 0 else f"⏳ Осталось: {int((exp - now) // 60)} мин."
+            lines.append(f"• **{info.get('name', uid_str)}** — {rem}")
+            kb.button(text=f"❌ Забрать у {info.get('name', uid_str)[:18]}", callback_data=f"revoke:{uid_str}")
+
+        save_access_db(access_db)
+        kb.adjust(1)
+        await message.answer("\n".join(lines), parse_mode="Markdown", reply_markup=kb.as_markup())
+
+    @d.callback_query(F.data.startswith("revoke:"))
+    async def cb_revoke(call: types.CallbackQuery):
+        if not is_admin(call.from_user.id):
+            return
+        uid_str = call.data.split(":")[1]
+        removed = access_db.get("users", {}).pop(uid_str, None)
+        save_access_db(access_db)
+        await call.answer("Доступ закрыт!")
+        await call.message.edit_text(f"🔒 Доступ у пользователя `{uid_str}` отозван.", parse_mode="Markdown")
+        try:
+            await bot_inst.send_message(int(uid_str), "🔒 Твой доступ к боту завершён.")
+        except Exception:
+            pass
+
+    # Стандартные кнопки меню
     @d.message(F.text == "Новый чат")
     @d.message(Command("clear"))
     async def clear_cmd(message: types.Message):
+        if not check_access(message.from_user.id):
+            return
         web_chats.pop(message.from_user.id, None)
         user_history[message.from_user.id] = []
-        await message.answer("Новый чат начат.", reply_markup=get_main_reply_kb())
+        await message.answer("Новый чат начат.", reply_markup=get_main_reply_kb(message.from_user.id))
 
     @d.message(F.text == "Модель")
     async def menu_models(message: types.Message):
+        if not check_access(message.from_user.id):
+            return
         cur = get_prefs(message.from_user.id)["model"]
         kb = InlineKeyboardBuilder()
         for label, code in MODELS_LIST:
@@ -271,6 +470,8 @@ def create_dispatcher(bot_inst: Bot):
 
     @d.callback_query(F.data.startswith("model:"))
     async def cb_model(call: types.CallbackQuery):
+        if not check_access(call.from_user.id):
+            return
         _, code, label = call.data.split(":", 2)
         prefs = get_prefs(call.from_user.id)
         prefs["model"] = code
@@ -280,6 +481,8 @@ def create_dispatcher(bot_inst: Bot):
 
     @d.message(F.text == "Уровень рассуждений")
     async def menu_reasoning(message: types.Message):
+        if not check_access(message.from_user.id):
+            return
         cur = get_prefs(message.from_user.id)["reasoning"]
         kb = InlineKeyboardBuilder()
         for label, code in REASONING_LIST:
@@ -290,6 +493,8 @@ def create_dispatcher(bot_inst: Bot):
 
     @d.callback_query(F.data.startswith("reason:"))
     async def cb_reason(call: types.CallbackQuery):
+        if not check_access(call.from_user.id):
+            return
         code = call.data.split(":", 1)[1]
         get_prefs(call.from_user.id)["reasoning"] = code
         label = dict((v, k) for k, v in REASONING_LIST).get(code, code)
@@ -298,6 +503,8 @@ def create_dispatcher(bot_inst: Bot):
 
     @d.message(F.text == "Инструменты")
     async def menu_tools(message: types.Message):
+        if not check_access(message.from_user.id):
+            return
         cur = get_prefs(message.from_user.id)["tool"]
         kb = InlineKeyboardBuilder()
         for label, code in TOOLS_LIST:
@@ -308,6 +515,8 @@ def create_dispatcher(bot_inst: Bot):
 
     @d.callback_query(F.data.startswith("tool:"))
     async def cb_tool(call: types.CallbackQuery):
+        if not check_access(call.from_user.id):
+            return
         code = call.data.split(":", 1)[1]
         get_prefs(call.from_user.id)["tool"] = code
         label = dict((v, k) for k, v in TOOLS_LIST).get(code, code)
@@ -316,21 +525,31 @@ def create_dispatcher(bot_inst: Bot):
 
     @d.message(F.text)
     async def handle_text(message: types.Message):
+        uid = message.from_user.id
+        if not check_access(uid):
+            await message.answer("🔒 Доступ закрыт. Отправь заявку владельцу:", reply_markup=get_locked_kb())
+            return
+
         await bot_inst.send_chat_action(chat_id=message.chat.id, action="typing")
         try:
             await ask_gemini_web(bot_inst, message, message.text)
         except Exception as web_err:
             try:
-                ans, used_model = await ask_gemini_fallback(message.from_user.id, message.text, message.text)
+                ans, used_model = await ask_gemini_fallback(uid, message.text, message.text)
                 warn = f"⚠️ [Запасной API ({used_model}) | Веб: {web_err}]\n\n"
                 await safe_send(message, warn + ans)
             except Exception as e:
-                await message.answer(f"Ошибка: {e}", reply_markup=get_main_reply_kb())
+                await message.answer(f"Ошибка: {e}", reply_markup=get_main_reply_kb(uid))
 
     @d.message(F.photo)
     async def handle_photo(message: types.Message):
+        uid = message.from_user.id
+        if not check_access(uid):
+            await message.answer("🔒 Доступ закрыт. Отправь заявку владельцу:", reply_markup=get_locked_kb())
+            return
+
         await bot_inst.send_chat_action(chat_id=message.chat.id, action="typing")
-        temp_path = f"/tmp/photo_{message.from_user.id}.jpg"
+        temp_path = f"/tmp/photo_{uid}.jpg"
         try:
             photo = message.photo[-1]
             file_io = io.BytesIO()
@@ -345,20 +564,25 @@ def create_dispatcher(bot_inst: Bot):
             except Exception as web_err:
                 image = Image.open(file_io)
                 image.load()
-                ans, used_model = await ask_gemini_fallback(message.from_user.id, [caption, image], f"[Фото] {caption}")
+                ans, used_model = await ask_gemini_fallback(uid, [caption, image], f"[Фото] {caption}")
                 warn = f"⚠️ [Запасной API ({used_model}) | Веб: {web_err}]\n\n"
                 await safe_send(message, warn + ans)
         except Exception as e:
-            await message.answer(f"Ошибка: {e}", reply_markup=get_main_reply_kb())
+            await message.answer(f"Ошибка: {e}", reply_markup=get_main_reply_kb(uid))
         finally:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
 
     @d.message(F.document)
     async def handle_document(message: types.Message):
+        uid = message.from_user.id
+        if not check_access(uid):
+            await message.answer("🔒 Доступ закрыт. Отправь заявку владельцу:", reply_markup=get_locked_kb())
+            return
+
         await bot_inst.send_chat_action(chat_id=message.chat.id, action="typing")
         doc = message.document
-        temp_path = os.path.join("/tmp", doc.file_name or f"file_{message.from_user.id}")
+        temp_path = os.path.join("/tmp", doc.file_name or f"file_{uid}")
         try:
             file_io = io.BytesIO()
             await bot_inst.download(doc, destination=file_io)
@@ -368,7 +592,7 @@ def create_dispatcher(bot_inst: Bot):
             caption = message.caption or "Проанализируй файл."
             await ask_gemini_web(bot_inst, message, caption, file_path=temp_path)
         except Exception as e:
-            await message.answer(f"Ошибка файла: {e}", reply_markup=get_main_reply_kb())
+            await message.answer(f"Ошибка файла: {e}", reply_markup=get_main_reply_kb(uid))
         finally:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
@@ -376,7 +600,7 @@ def create_dispatcher(bot_inst: Bot):
     return d
 
 @st.cache_resource
-def launch_bot_v11():
+def launch_bot_v12():
     old_state = getattr(sys, "_active_tg_bot", None)
     if old_state:
         old_loop, old_dp = old_state
@@ -410,7 +634,7 @@ def launch_bot_v11():
     t.start()
     return t
 
-launch_bot_v11()
+launch_bot_v12()
 
 st.title("Gemini Bot")
 st.success("Активен")

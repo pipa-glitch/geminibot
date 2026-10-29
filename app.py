@@ -14,11 +14,7 @@ from google.genai import types as gtypes
 TELEGRAM_TOKEN = "9099534534:AAExrwposBIWvrkBZKbN32FMfUl0ecaVFrk"
 
 GEMINI_KEYS = [
-    "AQ.Ab8RN6Jzv5bdS62FhADiyMOO8VG_qnUgaFD42AezOLmXUfxAUQ",
-    "AQ.Ab8RN6JcLl4BftREZQvDUoGI0PBhw58D4ZSZsF5_a8c1dxlMfg",
-    "AQ.Ab8RN6LI0dQCRuAdOjIQVst5hnjqnYsCBinRH6Pi74DlSvZ4_g",
-    "AQ.Ab8RN6JPKdXq64cHyCjzQBU19YXiarugNcESphjIfAVmmfv9Pg",
-    "AQ.Ab8RN6L8hdVSMKGKfgSTy5aYRWCSZXoXOCX1VGeUGxeaMkPhyw",
+    "AQ.Ab8RN6KjLjxRA8ZUzOzXLbY7sDDfjG3z-1IE70OKBN1k0gsGxQ",
 ]
 # ==========================================
 

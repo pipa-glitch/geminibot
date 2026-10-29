@@ -140,6 +140,19 @@ async def get_web_client(force_reinit: bool = False):
             web_client = client
     return web_client
 
+# Автоматическое удаление старого чата с серверов gemini.google.com
+async def delete_old_web_chat(uid: int):
+    old_chat = web_chats.pop(uid, None)
+    if old_chat is not None and web_client is not None:
+        try:
+            cid = getattr(old_chat, "cid", None)
+            if not cid and getattr(old_chat, "metadata", None):
+                cid = old_chat.metadata[0]
+            if cid and hasattr(web_client, "delete_chat"):
+                await web_client.delete_chat(cid)
+        except Exception:
+            pass
+
 def resolve_clean_model(client, model_code: str):
     code = model_code.lower()
     if hasattr(client, "list_models"):
@@ -211,7 +224,6 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
 
     files = [file_path] if file_path else None
 
-    # Две попытки: если сессия чата устарела — автоматически переподключаем Веб-клиент и пробуем снова!
     last_web_err = None
     response = None
     for attempt in range(2):
@@ -234,7 +246,7 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
             break
         except Exception as e:
             last_web_err = e
-            web_chats.pop(uid, None)
+            await delete_old_web_chat(uid)
             continue
 
     if response is None:
@@ -324,7 +336,8 @@ def create_dispatcher(bot_inst: Bot):
             )
             return
 
-        web_chats.pop(uid, None)
+        await delete_old_web_chat(uid)
+        user_history[uid] = []
         prefs = get_prefs(uid)
         r_label = dict((v, k) for k, v in REASONING_LIST).get(prefs["reasoning"], prefs["reasoning"])
         await message.answer(
@@ -447,7 +460,8 @@ def create_dispatcher(bot_inst: Bot):
             return
         await call.answer("Переподключаю веб-сессию...")
         try:
-            web_chats.clear()
+            for uid in list(web_chats.keys()):
+                await delete_old_web_chat(uid)
             await get_web_client(force_reinit=True)
             await call.message.edit_text("✅ **Веб-сессия Gemini Pro успешно переподключена!**", parse_mode="Markdown")
         except Exception as e:
@@ -460,6 +474,7 @@ def create_dispatcher(bot_inst: Bot):
         uid_str = call.data.split(":")[1]
         access_db.get("users", {}).pop(uid_str, None)
         save_access_db(access_db)
+        await delete_old_web_chat(int(uid_str))
         await call.answer("Доступ закрыт!")
         await call.message.edit_text(f"🔒 Доступ у пользователя `{uid_str}` отозван.", parse_mode="Markdown")
         try:
@@ -470,11 +485,12 @@ def create_dispatcher(bot_inst: Bot):
     @d.message(F.text == "Новый чат")
     @d.message(Command("clear"))
     async def clear_cmd(message: types.Message):
-        if not check_access(message.from_user.id):
+        uid = message.from_user.id
+        if not check_access(uid):
             return
-        web_chats.pop(message.from_user.id, None)
-        user_history[message.from_user.id] = []
-        await message.answer("Новый чат начат.", reply_markup=get_main_reply_kb(message.from_user.id))
+        await delete_old_web_chat(uid)
+        user_history[uid] = []
+        await message.answer("Старый чат удалён, начат новый.", reply_markup=get_main_reply_kb(uid))
 
     @d.message(F.text == "Модель")
     async def menu_models(message: types.Message):
@@ -620,17 +636,19 @@ def create_dispatcher(bot_inst: Bot):
     return d
 
 @st.cache_resource
-def launch_bot_v13():
+def launch_bot_v14():
     gen_id = time.time()
     sys._active_tg_gen = gen_id
 
-    # Правильная остановка корутины старого потока и закрытие его сессии
+    # Безопасная остановка старого потока (поддерживает и 2, и 3 элемента в кортеже)
     old_state = getattr(sys, "_active_tg_bot", None)
     if old_state:
-        old_loop, old_dp, old_bot = old_state
         try:
+            old_loop = old_state[0]
+            old_dp = old_state[1]
             asyncio.run_coroutine_threadsafe(old_dp.stop_polling(), old_loop)
-            asyncio.run_coroutine_threadsafe(old_bot.session.close(), old_loop)
+            if len(old_state) > 2 and old_state[2] is not None:
+                asyncio.run_coroutine_threadsafe(old_state[2].session.close(), old_loop)
         except Exception:
             pass
         time.sleep(1.5)
@@ -656,7 +674,7 @@ def launch_bot_v13():
     t.start()
     return t
 
-launch_bot_v13()
+launch_bot_v14()
 
 st.title("Gemini Bot")
 st.success("Активен")

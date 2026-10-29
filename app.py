@@ -65,11 +65,8 @@ def check_access(uid: int) -> bool:
     if not u_info:
         return False
     exp = u_info.get("expires_at", 0)
-    if exp == 0:  # 0 = Навсегда
+    if exp == 0 or time.time() < exp:
         return True
-    if time.time() < exp:
-        return True
-    # Срок вышел — удаляем
     access_db["users"].pop(str(uid), None)
     save_access_db(access_db)
     return False
@@ -132,12 +129,12 @@ def get_locked_kb():
     kb.button(text="📩 Запросить доступ", callback_data="req_access")
     return kb.as_markup()
 
-async def get_web_client():
+async def get_web_client(force_reinit: bool = False):
     global web_client
     if not SECURE_1PSID:
         raise Exception("В Secrets не указан SECURE_1PSID")
     async with web_init_lock:
-        if web_client is None:
+        if force_reinit or web_client is None:
             client = GeminiClient(SECURE_1PSID.strip(), SECURE_1PSIDTS.strip() if SECURE_1PSIDTS else None)
             await client.init(timeout=30, auto_refresh=True)
             web_client = client
@@ -200,26 +197,11 @@ async def safe_send(message: types.Message, text: str):
             await message.answer(part, parse_mode=None, reply_markup=get_main_reply_kb(uid))
 
 async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, file_path: str = None):
-    client = await get_web_client()
     uid = message.from_user.id
     prefs = get_prefs(uid)
 
-    target_model = resolve_clean_model(client, prefs["model"])
-
-    if uid not in web_chats:
-        web_chats[uid] = client.start_chat(model=target_model) if target_model else client.start_chat()
-    else:
-        old_chat = web_chats[uid]
-        if target_model:
-            try:
-                web_chats[uid] = client.start_chat(model=target_model, metadata=old_chat.metadata)
-            except Exception:
-                old_chat.model = target_model
-
-    chat = web_chats[uid]
-    tool = prefs["tool"]
-
     clean_prompt = prompt
+    tool = prefs["tool"]
     if tool == "image":
         clean_prompt = f"Создай или отредактируй изображение: {prompt}"
     elif tool == "video":
@@ -228,7 +210,35 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
         clean_prompt = f"Создай музыку: {prompt}"
 
     files = [file_path] if file_path else None
-    response = await asyncio.wait_for(chat.send_message(clean_prompt, files=files), timeout=45)
+
+    # Две попытки: если сессия чата устарела — автоматически переподключаем Веб-клиент и пробуем снова!
+    last_web_err = None
+    response = None
+    for attempt in range(2):
+        try:
+            client = await get_web_client(force_reinit=(attempt == 1))
+            target_model = resolve_clean_model(client, prefs["model"])
+
+            if attempt == 1 or uid not in web_chats:
+                web_chats[uid] = client.start_chat(model=target_model) if target_model else client.start_chat()
+            else:
+                old_chat = web_chats[uid]
+                if target_model:
+                    try:
+                        web_chats[uid] = client.start_chat(model=target_model, metadata=old_chat.metadata)
+                    except Exception:
+                        old_chat.model = target_model
+
+            chat = web_chats[uid]
+            response = await asyncio.wait_for(chat.send_message(clean_prompt, files=files), timeout=45)
+            break
+        except Exception as e:
+            last_web_err = e
+            web_chats.pop(uid, None)
+            continue
+
+    if response is None:
+        raise Exception(last_web_err)
 
     if getattr(response, "images", None):
         await bot_inst.send_chat_action(chat_id=message.chat.id, action="upload_photo")
@@ -289,7 +299,6 @@ async def ask_gemini_fallback(user_id: int, new_content, history_text: str):
 def create_dispatcher(bot_inst: Bot):
     d = Dispatcher()
 
-    # Секретная команда активации Владельца: /owner 322
     @d.message(Command("owner"))
     async def claim_owner(message: types.Message):
         parts = message.text.split()
@@ -325,7 +334,6 @@ def create_dispatcher(bot_inst: Bot):
             reply_markup=get_main_reply_kb(uid)
         )
 
-    # Заявка на доступ от нового человека
     @d.callback_query(F.data == "req_access")
     async def cb_req_access(call: types.CallbackQuery):
         uid = call.from_user.id
@@ -359,7 +367,6 @@ def create_dispatcher(bot_inst: Bot):
         await call.answer("Заявка отправлена владельцу!")
         await call.message.edit_text("⏳ **Заявка отправлена!** Ожидай подтверждения от владельца.", parse_mode="Markdown")
 
-    # Выдача доступа админом
     @d.callback_query(F.data.startswith("grant:"))
     async def cb_grant(call: types.CallbackQuery):
         if not is_admin(call.from_user.id):
@@ -406,38 +413,52 @@ def create_dispatcher(bot_inst: Bot):
         except Exception:
             pass
 
-    # Панель управления клиентами
     @d.message(F.text == "👑 Админка")
     async def admin_panel(message: types.Message):
         if not is_admin(message.from_user.id):
             return
         users = access_db.get("users", {})
-        if not users:
-            await message.answer("👑 **Админ-панель**\n\nСейчас активных клиентов нет.", parse_mode="Markdown")
-            return
-
         kb = InlineKeyboardBuilder()
-        lines = ["👑 **Активные пользователи:**\n"]
+        kb.button(text="🔄 Переподключить Веб-Gemini", callback_data="reconnect_web")
+
+        lines = ["👑 **Админ-панель**\n"]
         now = time.time()
+        active_count = 0
         for uid_str, info in list(users.items()):
             exp = info.get("expires_at", 0)
             if exp != 0 and now >= exp:
                 users.pop(uid_str, None)
                 continue
+            active_count += 1
             rem = "♾ Навсегда" if exp == 0 else f"⏳ Осталось: {int((exp - now) // 60)} мин."
             lines.append(f"• **{info.get('name', uid_str)}** — {rem}")
             kb.button(text=f"❌ Забрать у {info.get('name', uid_str)[:18]}", callback_data=f"revoke:{uid_str}")
 
+        if active_count == 0:
+            lines.append("Сейчас активных клиентов нет.")
+
         save_access_db(access_db)
         kb.adjust(1)
         await message.answer("\n".join(lines), parse_mode="Markdown", reply_markup=kb.as_markup())
+
+    @d.callback_query(F.data == "reconnect_web")
+    async def cb_reconnect_web(call: types.CallbackQuery):
+        if not is_admin(call.from_user.id):
+            return
+        await call.answer("Переподключаю веб-сессию...")
+        try:
+            web_chats.clear()
+            await get_web_client(force_reinit=True)
+            await call.message.edit_text("✅ **Веб-сессия Gemini Pro успешно переподключена!**", parse_mode="Markdown")
+        except Exception as e:
+            await call.message.edit_text(f"⚠️ Не удалось переподключить Веб: `{e}`", parse_mode="Markdown")
 
     @d.callback_query(F.data.startswith("revoke:"))
     async def cb_revoke(call: types.CallbackQuery):
         if not is_admin(call.from_user.id):
             return
         uid_str = call.data.split(":")[1]
-        removed = access_db.get("users", {}).pop(uid_str, None)
+        access_db.get("users", {}).pop(uid_str, None)
         save_access_db(access_db)
         await call.answer("Доступ закрыт!")
         await call.message.edit_text(f"🔒 Доступ у пользователя `{uid_str}` отозван.", parse_mode="Markdown")
@@ -446,7 +467,6 @@ def create_dispatcher(bot_inst: Bot):
         except Exception:
             pass
 
-    # Стандартные кнопки меню
     @d.message(F.text == "Новый чат")
     @d.message(Command("clear"))
     async def clear_cmd(message: types.Message):
@@ -600,25 +620,27 @@ def create_dispatcher(bot_inst: Bot):
     return d
 
 @st.cache_resource
-def launch_bot_v12():
-    old_state = getattr(sys, "_active_tg_bot", None)
-    if old_state:
-        old_loop, old_dp = old_state
-        try:
-            old_loop.call_soon_threadsafe(old_dp.stop_polling)
-        except Exception:
-            pass
-        time.sleep(1)
-
+def launch_bot_v13():
     gen_id = time.time()
     sys._active_tg_gen = gen_id
+
+    # Правильная остановка корутины старого потока и закрытие его сессии
+    old_state = getattr(sys, "_active_tg_bot", None)
+    if old_state:
+        old_loop, old_dp, old_bot = old_state
+        try:
+            asyncio.run_coroutine_threadsafe(old_dp.stop_polling(), old_loop)
+            asyncio.run_coroutine_threadsafe(old_bot.session.close(), old_loop)
+        except Exception:
+            pass
+        time.sleep(1.5)
 
     def worker():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         bot_inst = Bot(token=TELEGRAM_TOKEN)
         dp_inst = create_dispatcher(bot_inst)
-        sys._active_tg_bot = (loop, dp_inst)
+        sys._active_tg_bot = (loop, dp_inst, bot_inst)
 
         async def runner():
             while getattr(sys, "_active_tg_gen", None) == gen_id:
@@ -634,7 +656,7 @@ def launch_bot_v12():
     t.start()
     return t
 
-launch_bot_v12()
+launch_bot_v13()
 
 st.title("Gemini Bot")
 st.success("Активен")

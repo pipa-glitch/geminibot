@@ -1,22 +1,41 @@
 import io
+import re
 import asyncio
 import threading
 from datetime import datetime, timezone, timedelta
 from PIL import Image
 import streamlit as st
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from google import genai
 from google.genai import types as gtypes
 
-# Ключи и токен теперь берутся из скрытого сейфа Streamlit (GitHub их не видит!)
+# Ключи и токен из сейфа Streamlit
 TELEGRAM_TOKEN = st.secrets["TELEGRAM_TOKEN"]
 GEMINI_KEYS = st.secrets["GEMINI_KEYS"]
 
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 
+# Память диалогов для каждого пользователя
+user_history = {}
+
 async def safe_send(message: types.Message, text: str):
+    # Проверяем, не решила ли нейросеть отправить ответ файлом
+    if text.strip().startswith("SEND_FILE:"):
+        lines = text.strip().split("\n", 1)
+        filename = lines[0].replace("SEND_FILE:", "").strip() or "code.py"
+        file_content = lines[1] if len(lines) > 1 else ""
+
+        # Очищаем от лишних кавычек ```python ... ```, если нейросеть их добавила
+        file_content = re.sub(r"^```[a-zA-Z0-9_-]*\n", "", file_content.strip())
+        file_content = re.sub(r"\n```$", "", file_content.strip())
+
+        doc = types.BufferedInputFile(file_content.encode("utf-8"), filename=filename)
+        await message.answer_document(doc, caption=f"📄 Готово! Твой файл: {filename}")
+        return
+
+    # Обычная отправка текста
     max_len = 4000
     for i in range(0, len(text), max_len):
         part = text[i:i + max_len]
@@ -25,10 +44,19 @@ async def safe_send(message: types.Message, text: str):
         except Exception:
             await message.answer(part, parse_mode=None)
 
-async def ask_gemini(contents):
+async def ask_gemini(user_id: int, new_content, history_text_for_save: str):
     last_error = None
     tz_msk = timezone(timedelta(hours=3))
     current_time = datetime.now(tz_msk).strftime("%d.%m.%Y, %H:%M")
+
+    # Берём историю переписки пользователя (храним последние 14 сообщений)
+    history = user_history.get(user_id, [])
+
+    # Собираем контекст диалога + текущее сообщение
+    full_contents = []
+    for item in history:
+        full_contents.append(item)
+    full_contents.append(new_content)
 
     for index, key in enumerate(GEMINI_KEYS):
         try:
@@ -36,7 +64,7 @@ async def ask_gemini(contents):
             response = await asyncio.to_thread(
                 client.models.generate_content,
                 model="gemini-3.5-flash-lite",
-                contents=contents,
+                contents=full_contents,
                 config=gtypes.GenerateContentConfig(
                     system_instruction=(
                         f"Сейчас точная реальная дата и время (МСК): {current_time}. "
@@ -50,35 +78,49 @@ async def ask_gemini(contents):
                         "   - Дроби через слэш: (-4)/2 или (4 ± 4√3)/2\n"
                         "   - Знаки: ±, ≈, ≠, ≤, ≥, стрелку через '=>', объединение словом 'и' или 'U'.\n"
                         "3. Не используй решетки '###' для заголовков. Выделяй важное просто жирным шрифтом.\n"
-                        "4. Ответ должен быть чистым, структурированным и удобным для чтения с телефона."
+                        "4. ОТПРАВКА ФАЙЛОВ: У тебя ЕСТЬ функция отправки файлов! Никогда не говори, что не можешь отправлять файлы. "
+                        "Если пользователь просит отправить код или текст файлом (например: 'отправь файлом', 'скинь .py', 'сделай файлом'), "
+                        "напиши в САМОЙ ПЕРВОЙ СТРОКЕ ответа строго: SEND_FILE:имя_файла.расширение (например SEND_FILE:game.py или SEND_FILE:essay.txt), "
+                        "а со следующей строки напиши ТОЛЬКО чистый код или текст для этого файла без лишних комментариев."
                     )
                 ),
             )
-            return response.text
-        except Exception as e:
-            err_str = str(e).lower()
-            last_error = e
-            if "429" in err_str or "quota" in err_str or "resource_exhausted" in err_str:
-                continue
-            else:
-                raise e
+            answer_text = response.text or "Пустой ответ."
 
-    raise Exception(f"Все ключи исчерпали лимиты! Ошибка: {last_error}")
+            # Сохраняем вопрос и ответ в память диалога
+            history.append(f"Пользователь: {history_text_for_save}")
+            history.append(f"Ассистент: {answer_text}")
+            user_history[user_id] = history[-14:]
+
+            return answer_text
+        except Exception as e:
+            last_error = e
+            continue
+
+    raise Exception(f"Все ключи выдали ошибку! Последняя: {last_error}")
 
 @dp.message(CommandStart())
 async def start_cmd(message: types.Message):
+    user_history[message.from_user.id] = []
     await message.answer(
-        "👋 Привет! Я твой школьный помощник на базе Google Gemini.\n\n"
-        "• Задавай любые вопросы текстом.\n"
-        "• Присылай фотки задач, карточек или тетрадей — всё распишу подробно и по шагам!"
+        "👋 Привет! Я твой прокачанный помощник на базе Google Gemini.\n\n"
+        "• Я помню контекст нашего разговора!\n"
+        "• Присылай фотки задач или вопросы.\n"
+        "• Напиши «отправь файлом» — и я скину любой код или текст готовым файлом!\n"
+        "• Команда /clear — очистить память диалога."
     )
+
+@dp.message(Command("clear"))
+async def clear_cmd(message: types.Message):
+    user_history[message.from_user.id] = []
+    await message.answer("🧹 Память диалога очищена! Можем начать новую тему.")
 
 @dp.message(F.text)
 async def handle_text(message: types.Message):
     await bot.send_chat_action(chat_id=message.chat.id, action="typing")
     try:
-        answer = await ask_gemini(message.text)
-        await safe_send(message, answer or "Нейросеть прислала пустой ответ.")
+        answer = await ask_gemini(message.from_user.id, message.text, message.text)
+        await safe_send(message, answer)
     except Exception as e:
         await message.answer(f"⚠️ Ошибка: {e}")
 
@@ -95,8 +137,8 @@ async def handle_photo(message: types.Message):
 
         caption = message.caption or "Объясни подробно всё, что изображено на фото, и реши задание."
 
-        answer = await ask_gemini([caption, image])
-        await safe_send(message, answer or "Не удалось распознать фото.")
+        answer = await ask_gemini(message.from_user.id, [caption, image], f"[Фото] {caption}")
+        await safe_send(message, answer)
     except Exception as e:
         await message.answer(f"⚠️ Ошибка при обработке фото: {e}")
 
@@ -106,11 +148,11 @@ async def start_aiogram_loop():
             await bot.delete_webhook(drop_pending_updates=True)
             await dp.start_polling(bot, handle_signals=False)
         except Exception as e:
-            print(f"[!] Сбой подключения Telegram: {e}. Перезапуск через 3 сек...")
+            print(f"[!] Перезапуск через 3 сек: {e}")
             await asyncio.sleep(3)
 
 @st.cache_resource
-def start_bot_background():
+def start_bot_background_v2():
     def worker():
         asyncio.run(start_aiogram_loop())
 
@@ -118,7 +160,7 @@ def start_bot_background():
     t.start()
     return t
 
-start_bot_background()
+start_bot_background_v2()
 
-st.title("🤖 Telegram Gemini Bot")
-st.success("✅ Бот успешно работает в облаке 24/7!")
+st.title("🤖 Telegram Gemini Bot v2.0")
+st.success("✅ Бот с памятью и отправкой файлов работает 24/7!")

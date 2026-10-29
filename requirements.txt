@@ -2,3 +2,4 @@ aiogram
 google-genai
 pillow
 streamlit
+gemini-webapi

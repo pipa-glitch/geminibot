@@ -3,7 +3,7 @@ import asyncio
 import threading
 from datetime import datetime
 from PIL import Image
-import gradio as gr
+import streamlit as st
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
 from google import genai
@@ -102,15 +102,19 @@ async def handle_photo(message: types.Message):
     except Exception as e:
         await message.answer(f"⚠️ Ошибка при обработке фото: {e}")
 
-# Функция запуска бота в отдельном потоке
-def run_telegram_bot():
-    asyncio.run(dp.start_polling(bot))
+# Запуск телеграм-бота ровно один раз в фоновом потоке
+@st.cache_resource
+def start_bot_background():
+    def run_polling():
+        asyncio.run(dp.start_polling(bot))
 
-# Запускаем телеграм-бота в фоне
-threading.Thread(target=run_telegram_bot, daemon=True).start()
+    t = threading.Thread(target=run_polling, daemon=True)
+    t.start()
+    return t
 
-# Простая веб-страничка для Hugging Face (чтобы сервер работал)
-with gr.Blocks() as demo:
-    gr.Markdown("# 🤖 Telegram Gemini Bot запущен и работает 24/7!")
+start_bot_background()
 
-demo.launch(server_name="0.0.0.0", server_port=7860)
+# Интерфейс для страницы Streamlit
+st.title("🤖 Telegram Gemini Bot")
+st.success("✅ Бот успешно запущен в облаке и работает 24/7!")
+st.info("Теперь компьютер можно выключать — бот отвечает прямо из дата-центра.")

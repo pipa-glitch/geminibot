@@ -1,7 +1,9 @@
 import io
 import re
+import urllib.parse
 import asyncio
 import threading
+import aiohttp
 from datetime import datetime, timezone, timedelta
 from PIL import Image
 import streamlit as st
@@ -10,24 +12,39 @@ from aiogram.filters import CommandStart, Command
 from google import genai
 from google.genai import types as gtypes
 
-# Ключи и токен из сейфа Streamlit
 TELEGRAM_TOKEN = st.secrets["TELEGRAM_TOKEN"]
 GEMINI_KEYS = st.secrets["GEMINI_KEYS"]
 
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 
-# Память диалогов для каждого пользователя
 user_history = {}
 
 async def safe_send(message: types.Message, text: str):
-    # Проверяем, не решила ли нейросеть отправить ответ файлом
+    # 1. Проверяем, не нужно ли сгенерировать и отправить КАРТИНКУ
+    if text.strip().startswith("SEND_IMAGE:"):
+        prompt_en = text.strip().replace("SEND_IMAGE:", "").strip().split("\n")[0]
+        await bot.send_chat_action(chat_id=message.chat.id, action="upload_photo")
+        try:
+            encoded_prompt = urllib.parse.quote(prompt_en)
+            image_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(image_url, timeout=45) as resp:
+                    if resp.status == 200:
+                        img_bytes = await resp.read()
+                        photo_file = types.BufferedInputFile(img_bytes, filename="image.jpg")
+                        await message.answer_photo(photo_file, caption="🎨 Держи картинку!")
+                        return
+        except Exception as e:
+            await message.answer(f"⚠️ Не удалось нарисовать картинку: {e}")
+            return
+
+    # 2. Проверяем, не нужно ли отправить ФАЙЛ
     if text.strip().startswith("SEND_FILE:"):
         lines = text.strip().split("\n", 1)
         filename = lines[0].replace("SEND_FILE:", "").strip() or "code.py"
         file_content = lines[1] if len(lines) > 1 else ""
 
-        # Очищаем от лишних кавычек ```python ... ```, если нейросеть их добавила
         file_content = re.sub(r"^```[a-zA-Z0-9_-]*\n", "", file_content.strip())
         file_content = re.sub(r"\n```$", "", file_content.strip())
 
@@ -35,7 +52,7 @@ async def safe_send(message: types.Message, text: str):
         await message.answer_document(doc, caption=f"📄 Готово! Твой файл: {filename}")
         return
 
-    # Обычная отправка текста
+    # 3. Обычная отправка текста
     max_len = 4000
     for i in range(0, len(text), max_len):
         part = text[i:i + max_len]
@@ -49,14 +66,8 @@ async def ask_gemini(user_id: int, new_content, history_text_for_save: str):
     tz_msk = timezone(timedelta(hours=3))
     current_time = datetime.now(tz_msk).strftime("%d.%m.%Y, %H:%M")
 
-    # Берём историю переписки пользователя (храним последние 14 сообщений)
     history = user_history.get(user_id, [])
-
-    # Собираем контекст диалога + текущее сообщение
-    full_contents = []
-    for item in history:
-        full_contents.append(item)
-    full_contents.append(new_content)
+    full_contents = list(history) + [new_content]
 
     for index, key in enumerate(GEMINI_KEYS):
         try:
@@ -78,16 +89,17 @@ async def ask_gemini(user_id: int, new_content, history_text_for_save: str):
                         "   - Дроби через слэш: (-4)/2 или (4 ± 4√3)/2\n"
                         "   - Знаки: ±, ≈, ≠, ≤, ≥, стрелку через '=>', объединение словом 'и' или 'U'.\n"
                         "3. Не используй решетки '###' для заголовков. Выделяй важное просто жирным шрифтом.\n"
-                        "4. ОТПРАВКА ФАЙЛОВ: У тебя ЕСТЬ функция отправки файлов! Никогда не говори, что не можешь отправлять файлы. "
-                        "Если пользователь просит отправить код или текст файлом (например: 'отправь файлом', 'скинь .py', 'сделай файлом'), "
-                        "напиши в САМОЙ ПЕРВОЙ СТРОКЕ ответа строго: SEND_FILE:имя_файла.расширение (например SEND_FILE:game.py или SEND_FILE:essay.txt), "
-                        "а со следующей строки напиши ТОЛЬКО чистый код или текст для этого файла без лишних комментариев."
+                        "4. ОТПРАВКА ФАЙЛОВ: Если пользователь просит отправить код или текст файлом, "
+                        "напиши в САМОЙ ПЕРВОЙ СТРОКЕ строго: SEND_FILE:имя_файла.расширение, а со следующей строки — чистый код/текст файла.\n"
+                        "5. ГЕНЕРАЦИЯ КАРТИНОК: У тебя ЕСТЬ функция генерации и отправки картинок! Никогда не говори, что не умеешь отправлять картинки. "
+                        "Если пользователь просит кинуть картинку, фото или что-то нарисовать (например: 'кинь картинку кота', 'нарисуй машину'), "
+                        "ответь ОДНОЙ строкой строго в формате: SEND_IMAGE:подробное описание картинки на английском языке "
+                        "(например: SEND_IMAGE:cute fluffy cat sitting on a windowsill, realistic photo, high quality). Никакого другого текста не добавляй!"
                     )
                 ),
             )
             answer_text = response.text or "Пустой ответ."
 
-            # Сохраняем вопрос и ответ в память диалога
             history.append(f"Пользователь: {history_text_for_save}")
             history.append(f"Ассистент: {answer_text}")
             user_history[user_id] = history[-14:]
@@ -104,16 +116,16 @@ async def start_cmd(message: types.Message):
     user_history[message.from_user.id] = []
     await message.answer(
         "👋 Привет! Я твой прокачанный помощник на базе Google Gemini.\n\n"
-        "• Я помню контекст нашего разговора!\n"
-        "• Присылай фотки задач или вопросы.\n"
-        "• Напиши «отправь файлом» — и я скину любой код или текст готовым файлом!\n"
-        "• Команда /clear — очистить память диалога."
+        "• Помню контекст диалога (очистить: /clear).\n"
+        "• Решаю задачи по фото и тексту.\n"
+        "• Умею кидать готовые файлы (напиши «отправь файлом»).\n"
+        "• Умею рисовать и кидать любые картинки (напиши «кинь картинку ...»)!"
     )
 
 @dp.message(Command("clear"))
 async def clear_cmd(message: types.Message):
     user_history[message.from_user.id] = []
-    await message.answer("🧹 Память диалога очищена! Можем начать новую тему.")
+    await message.answer("🧹 Память диалога очищена!")
 
 @dp.message(F.text)
 async def handle_text(message: types.Message):
@@ -152,7 +164,7 @@ async def start_aiogram_loop():
             await asyncio.sleep(3)
 
 @st.cache_resource
-def start_bot_background_v2():
+def start_bot_background_v3():
     def worker():
         asyncio.run(start_aiogram_loop())
 
@@ -160,7 +172,7 @@ def start_bot_background_v2():
     t.start()
     return t
 
-start_bot_background_v2()
+start_bot_background_v3()
 
-st.title("🤖 Telegram Gemini Bot v2.0")
-st.success("✅ Бот с памятью и отправкой файлов работает 24/7!")
+st.title("🤖 Telegram Gemini Bot v3.0")
+st.success("✅ Бот (Память + Файлы + Генерация картинок) работает 24/7!")

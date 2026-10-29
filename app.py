@@ -1,7 +1,6 @@
 import io
 import asyncio
 import threading
-import time
 from datetime import datetime, timezone, timedelta
 from PIL import Image
 import streamlit as st
@@ -10,18 +9,13 @@ from aiogram.filters import CommandStart
 from google import genai
 from google.genai import types as gtypes
 
-# ==========================================
-TELEGRAM_TOKEN = "9099534534:AAExrwposBIWvrkBZKbN32FMfUl0ecaVFrk"
-
-GEMINI_KEYS = [
-    "AQ.Ab8RN6KjLjxRA8ZUzOzXLbY7sDDfjG3z-1IE70OKBN1k0gsGxQ",
-]
-# ==========================================
+# Ключи и токен теперь берутся из скрытого сейфа Streamlit (GitHub их не видит!)
+TELEGRAM_TOKEN = st.secrets["TELEGRAM_TOKEN"]
+GEMINI_KEYS = st.secrets["GEMINI_KEYS"]
 
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 
-# Функция безопасной отправки сообщений (если Telegram ругается на разметку)
 async def safe_send(message: types.Message, text: str):
     max_len = 4000
     for i in range(0, len(text), max_len):
@@ -29,19 +23,16 @@ async def safe_send(message: types.Message, text: str):
         try:
             await message.answer(part, parse_mode="Markdown")
         except Exception:
-            # Если в тексте кривые спецсимволы и Markdown сломался — шлем простым текстом
             await message.answer(part, parse_mode=None)
 
-# Запрос к Gemini с перебором 5 ключей
 async def ask_gemini(contents):
     last_error = None
-    # Время по МСК (UTC+3), чтобы на сервере не врало
     tz_msk = timezone(timedelta(hours=3))
     current_time = datetime.now(tz_msk).strftime("%d.%m.%Y, %H:%M")
 
     for index, key in enumerate(GEMINI_KEYS):
         try:
-            client = genai.Client(api_key=key)
+            client = genai.Client(api_key=key.strip())
             response = await asyncio.to_thread(
                 client.models.generate_content,
                 model="gemini-3.5-flash-lite",
@@ -68,12 +59,11 @@ async def ask_gemini(contents):
             err_str = str(e).lower()
             last_error = e
             if "429" in err_str or "quota" in err_str or "resource_exhausted" in err_str:
-                print(f"[!] Лимит ключа #{index + 1} исчерпан. Переключаюсь на запасной ключ...")
                 continue
             else:
                 raise e
 
-    raise Exception(f"Все 5 ключей Gemini исчерпали лимиты! Ошибка: {last_error}")
+    raise Exception(f"Все ключи исчерпали лимиты! Ошибка: {last_error}")
 
 @dp.message(CommandStart())
 async def start_cmd(message: types.Message):
@@ -100,8 +90,6 @@ async def handle_photo(message: types.Message):
         file_io = io.BytesIO()
         await bot.download(photo, destination=file_io)
         file_io.seek(0)
-        
-        # Гарантируем полную загрузку картинки в память
         image = Image.open(file_io)
         image.load()
 
@@ -112,12 +100,10 @@ async def handle_photo(message: types.Message):
     except Exception as e:
         await message.answer(f"⚠️ Ошибка при обработке фото: {e}")
 
-# Вечный цикл запуска с автоподъемом при сбоях сети
 async def start_aiogram_loop():
     while True:
         try:
             await bot.delete_webhook(drop_pending_updates=True)
-            # handle_signals=False обязательно для работы в фоне без краша
             await dp.start_polling(bot, handle_signals=False)
         except Exception as e:
             print(f"[!] Сбой подключения Telegram: {e}. Перезапуск через 3 сек...")
@@ -132,10 +118,7 @@ def start_bot_background():
     t.start()
     return t
 
-# Старт бота
 start_bot_background()
 
-# Интерфейс страницы
 st.title("🤖 Telegram Gemini Bot")
 st.success("✅ Бот успешно работает в облаке 24/7!")
-st.caption("Сервер активен. Фоновый поток защищен от сбоев.")

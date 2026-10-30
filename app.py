@@ -3,6 +3,7 @@ import sys
 import io
 import re
 import json
+import copy
 import time
 import subprocess
 import asyncio
@@ -17,6 +18,23 @@ try:
 except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "-U", "gemini-webapi"])
     from gemini_webapi import GeminiClient
+
+# Патч HTTP/2 для curl_cffi (чтобы контейнер Streamlit не ронял поток на HTTP/3 QUIC)
+try:
+    from curl_cffi import CurlHttpVersion
+    from curl_cffi.requests import AsyncSession
+
+    if not getattr(AsyncSession, "_http2_patched", False):
+        _orig_init = AsyncSession.__init__
+
+        def _http2_init(self, *args, **kwargs):
+            kwargs["http_version"] = CurlHttpVersion.V2_0
+            _orig_init(self, *args, **kwargs)
+
+        AsyncSession.__init__ = _http2_init
+        AsyncSession._http2_patched = True
+except Exception:
+    pass
 
 from loguru import logger
 from aiogram import Bot, Dispatcher, types, F
@@ -39,6 +57,14 @@ MASTER_PIN = str(get_secret("MASTER_PIN", "322"))
 
 ACCESS_FILE = "access_db.json"
 
+# Настоящие рабочие хэши моделей веб-интерфейса Google (вместо битых [None-11] и [None-4])
+REAL_WEB_HEADERS = {
+    "flash-lite": ("8c46e95b1a07cecc", 6),
+    "flash": ("56fdd199312815e2", 1),
+    "pro": ("e6fa609c3fa255c0", 3),
+    "argon": ("e6fa609c3fa255c0", 3),
+}
+
 quota_by_model = {}
 force_quota_lock = False
 abuse_status_store = "✅ Чистый (Без ограничений)"
@@ -57,9 +83,9 @@ def _loguru_quota_sink(message):
         raw_ab = text.split("Account abuse status:", 1)[1].strip()
         abuse_status_store = "✅ Чистый (Без ограничений)" if "Clean" in raw_ab else raw_ab
 
-if not getattr(sys, "_quota_sink_v6", False):
+if not getattr(sys, "_quota_sink_v7", False):
     logger.add(_loguru_quota_sink)
-    sys._quota_sink_v6 = True
+    sys._quota_sink_v7 = True
 
 @asynccontextmanager
 async def continuous_typing(bot_inst: Bot, chat_id: int, action: str = "typing"):
@@ -270,6 +296,27 @@ def get_active_cookies():
     psidts = access_db.get("custom_psidts") or SECURE_1PSIDTS
     return psid.strip() if psid else "", psidts.strip() if psidts else None
 
+def repair_client_models(client):
+    """Чинит битые заголовки [None-11] и [None-4] внутри клиента после _fetch_quota"""
+    if not hasattr(client, "list_models"):
+        return
+    try:
+        for m in client.list_models() or []:
+            txt = (str(getattr(m, "display_name", "")) + " " + str(getattr(m, "model_name", ""))).lower()
+            if "lite" in txt:
+                m_hash, cat = REAL_WEB_HEADERS["flash-lite"]
+            elif "pro" in txt:
+                m_hash, cat = REAL_WEB_HEADERS["pro"]
+            else:
+                m_hash, cat = REAL_WEB_HEADERS["flash"]
+            hdr = getattr(m, "model_header", None)
+            if isinstance(hdr, dict):
+                hdr["x-goog-ext-525001261-jspb"] = f'[1,null,null,null,"{m_hash}",null,null,0,[4,5,6,8],null,null,2,null,null,{cat},1]'
+                hdr["x-goog-ext-73010989-jspb"] = "[0]"
+                hdr["x-goog-ext-73010990-jspb"] = "[0,0,0]"
+    except Exception:
+        pass
+
 async def get_web_client(force_reinit: bool = False):
     global web_client
     psid, psidts = get_active_cookies()
@@ -279,6 +326,7 @@ async def get_web_client(force_reinit: bool = False):
         if force_reinit or web_client is None:
             client = GeminiClient(psid, psidts)
             await client.init(timeout=30, auto_refresh=True)
+            repair_client_models(client)
             web_client = client
     return web_client
 
@@ -304,33 +352,28 @@ async def delete_old_web_chat(uid: int):
     except Exception:
         pass
 
-def resolve_clean_model(client, model_code: str):
-    """Использует ТОЛЬКО живые модели из текущей сессии аккаунта (list_models), чтобы сокет никогда не вис на 35с"""
+def resolve_clean_model(client, model_code: str, reasoning_code: str = "low"):
+    """Формирует 100% валидный заголовок модели с настоящим хэшем (без None) и нужным уровнем рассуждений"""
+    repair_client_models(client)
     code = model_code.lower()
+    m_hash, cat = REAL_WEB_HEADERS.get(code, REAL_WEB_HEADERS["flash"])
+    r_slot = 1 if reasoning_code == "low" else 2
+
+    valid_headers = {
+        "x-goog-ext-525001261-jspb": f'[1,null,null,null,"{m_hash}",null,null,0,[4,5,6,8],null,null,2,null,null,{cat},{r_slot}]',
+        "x-goog-ext-73010989-jspb": "[0]",
+        "x-goog-ext-73010990-jspb": "[0,0,0]",
+    }
+
     if hasattr(client, "list_models"):
         try:
             models = client.list_models() or []
             if models:
-                # 1. Ищем точное совпадение в живых моделях сессии
-                for m in models:
-                    txt = (str(getattr(m, "display_name", "")) + " " + str(getattr(m, "model_name", ""))).lower()
-                    if code == "flash-lite" and "lite" in txt:
-                        return m
-                    if code == "argon" and ("argon" in txt or "4" in txt):
-                        return m
-                    if code == "pro" and "pro" in txt:
-                        return m
-                    if code == "flash" and "flash" in txt and "lite" not in txt:
-                        return m
-                # 2. Если точной подмодели (например lite или argon) нет в живых квотах сессии — берём ближайшую живую (Flash или Pro)!
-                want_pro = code in ("pro", "argon")
-                for m in models:
-                    txt = (str(getattr(m, "display_name", "")) + " " + str(getattr(m, "model_name", ""))).lower()
-                    if want_pro and "pro" in txt:
-                        return m
-                    if not want_pro and "flash" in txt:
-                        return m
-                return models[0]
+                base_m = copy.deepcopy(models[0])
+                if hasattr(base_m, "model_header") and isinstance(base_m.model_header, dict):
+                    base_m.model_header.clear()
+                    base_m.model_header.update(valid_headers)
+                    return base_m
         except Exception:
             pass
     return None
@@ -383,7 +426,7 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
 
     client = await get_web_client()
     prefs = enforce_quota_restrictions(uid)
-    target_model = resolve_clean_model(client, prefs["model"])
+    target_model = resolve_clean_model(client, prefs["model"], prefs["reasoning"])
 
     if uid not in web_chats:
         web_chats[uid] = client.start_chat(model=target_model) if target_model else client.start_chat()
@@ -405,12 +448,15 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
         if ("quota" in err_s or "limit" in err_s or "429" in err_s) and prefs["model"] != "flash-lite":
             force_quota_lock = True
             prefs = enforce_quota_restrictions(uid)
-            lite_model = resolve_clean_model(client, "flash-lite")
+            lite_model = resolve_clean_model(client, "flash-lite", "low")
             web_chats[uid] = client.start_chat(model=lite_model) if lite_model else client.start_chat()
             response = await asyncio.wait_for(web_chats[uid].send_message(prompt, files=files), timeout=110)
             register_chat_cid(uid, web_chats[uid], response)
         else:
-            raise e
+            # Если заголовок модели вызвал сбой — пробуем чистый start_chat() без заголовка модели перед запаской
+            web_chats[uid] = client.start_chat()
+            response = await asyncio.wait_for(web_chats[uid].send_message(clean_prompt, files=files), timeout=90)
+            register_chat_cid(uid, web_chats[uid], response)
 
     stats_store["web_ok"] += 1
     stats_store["user_reqs"][str(uid)] = stats_store["user_reqs"].get(str(uid), 0) + 1
@@ -679,6 +725,7 @@ def create_dispatcher(bot_inst: Bot):
             client = await get_web_client(force_reinit=(web_client is None))
             if hasattr(client, "_fetch_quota"):
                 await client._fetch_quota()
+                repair_client_models(client)
             if hasattr(client, "_fetch_abuse_status"):
                 await client._fetch_abuse_status()
         except Exception as e:
@@ -913,7 +960,7 @@ def create_dispatcher(bot_inst: Bot):
     return d
 
 @st.cache_resource
-def launch_bot_v20():
+def launch_bot_v21():
     gen_id = time.time()
     sys._active_tg_gen = gen_id
 
@@ -950,7 +997,7 @@ def launch_bot_v20():
     t.start()
     return t
 
-launch_bot_v20()
+launch_bot_v21()
 
 st.title("Gemini Bot")
 st.success("Активен")

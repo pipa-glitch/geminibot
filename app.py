@@ -21,6 +21,18 @@ except ImportError:
     from gemini_webapi import GeminiClient
 
 try:
+    import pptx
+    from pptx import Presentation
+    from pptx.util import Inches, Pt
+    from pptx.dml.color import RGBColor
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-U", "python-pptx"])
+    import pptx
+    from pptx import Presentation
+    from pptx.util import Inches, Pt
+    from pptx.dml.color import RGBColor
+
+try:
     from curl_cffi import CurlHttpVersion
     from curl_cffi.requests import AsyncSession
 
@@ -82,11 +94,10 @@ def _loguru_quota_sink(message):
         raw_ab = text.split("Account abuse status:", 1)[1].strip()
         abuse_status_store = "✅ Чистый (Без ограничений)" if "Clean" in raw_ab else raw_ab
 
-if not getattr(sys, "_quota_sink_v8", False):
+if not getattr(sys, "_quota_sink_v9", False):
     logger.add(_loguru_quota_sink)
-    sys._quota_sink_v8 = True
+    sys._quota_sink_v9 = True
 
-# Конвертация Markdown со звездочками в чистый HTML для Telegram (без **, * и ###)
 def markdown_to_telegram_html(text: str) -> str:
     code_blocks = []
 
@@ -119,6 +130,130 @@ def markdown_to_telegram_html(text: str) -> str:
         text = text.replace(f"@@CODEBLOCK_{idx}@@", b_html)
 
     return text
+
+# Генератор настоящего файла PowerPoint (.pptx) в стиле Gemini Canvas
+def build_canvas_pptx(slides_data: list) -> bytes:
+    prs = Presentation()
+    prs.slide_width = Inches(13.333)
+    prs.slide_height = Inches(7.5)
+    blank_layout = prs.slide_layouts[6]
+
+    for idx, s in enumerate(slides_data):
+        slide = prs.slides.add_slide(blank_layout)
+        bg = slide.background
+        fill = bg.fill
+        fill.solid()
+        fill.fore_color.rgb = RGBColor(13, 25, 43)  # Тёмно-синий фон как в Canvas
+
+        tag_text = str(s.get("tag", f"СЛАЙД {idx + 1}")).upper()
+        title_text = str(s.get("title", f"Слайд {idx + 1}"))
+        subtitle_text = str(s.get("subtitle", ""))
+        points = s.get("points", [])
+
+        # Верхний голубой тег
+        tb_tag = slide.shapes.add_textbox(Inches(1.0), Inches(1.0), Inches(11.3), Inches(0.5))
+        p_tag = tb_tag.text_frame.paragraphs[0]
+        p_tag.text = tag_text
+        p_tag.font.size = Pt(11)
+        p_tag.font.bold = True
+        p_tag.font.color.rgb = RGBColor(56, 189, 248)
+
+        # Заголовок слайда
+        tb_title = slide.shapes.add_textbox(Inches(1.0), Inches(1.5), Inches(11.3), Inches(1.6))
+        tf_title = tb_title.text_frame
+        tf_title.word_wrap = True
+        p_title = tf_title.paragraphs[0]
+        p_title.text = title_text
+        p_title.font.size = Pt(34 if idx == 0 else 28)
+        p_title.font.bold = True
+        p_title.font.color.rgb = RGBColor(255, 255, 255)
+
+        # Контент слайда
+        tb_body = slide.shapes.add_textbox(Inches(1.0), Inches(3.2), Inches(11.3), Inches(3.6))
+        tf_body = tb_body.text_frame
+        tf_body.word_wrap = True
+
+        first_p = True
+        if subtitle_text:
+            p = tf_body.paragraphs[0]
+            first_p = False
+            p.text = subtitle_text
+            p.font.size = Pt(18)
+            p.font.color.rgb = RGBColor(148, 163, 184)
+            p.space_after = Pt(14)
+
+        for pt in points:
+            p = tf_body.paragraphs[0] if first_p else tf_body.add_paragraph()
+            first_p = False
+            p.text = f"• {pt}"
+            p.font.size = Pt(18)
+            p.font.color.rgb = RGBColor(226, 232, 240)
+            p.space_after = Pt(10)
+
+    out_io = io.BytesIO()
+    prs.save(out_io)
+    return out_io.getvalue()
+
+# Генератор интерактивной HTML-презентации (1-в-1 как окно Canvas со стрелочками)
+def build_canvas_html(slides_data: list) -> bytes:
+    slides_json = json.dumps(slides_data, ensure_ascii=False)
+    html_code = f"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Презентация Canvas</title>
+<style>
+  body {{ margin:0; background:#090d16; color:#fff; font-family:system-ui,-apple-system,sans-serif; display:flex; flex-direction:column; align-items:center; justify-content:center; min-height:100vh; }}
+  .nav {{ display:flex; align-items:center; gap:16px; background:#1e293b; padding:8px 20px; border-radius:99px; margin-bottom:20px; }}
+  .nav button {{ background:none; border:none; color:#fff; font-size:18px; cursor:pointer; padding:4px 10px; }}
+  .card {{ width:90%; max-width:900px; min-height:460px; background:linear-gradient(135deg,#0d1b2a,#1b263b); border-radius:20px; padding:48px; box-sizing:border-box; box-shadow:0 20px 50px rgba(0,0,0,0.6); display:flex; flex-direction:column; justify-content:center; }}
+  .tag {{ color:#38bdf8; font-size:13px; font-weight:700; letter-spacing:1.5px; text-transform:uppercase; margin-bottom:14px; }}
+  .title {{ font-size:36px; font-weight:800; margin:0 0 18px 0; line-height:1.2; font-family:Georgia,serif; }}
+  .sub {{ color:#94a3b8; font-size:18px; margin-bottom:22px; line-height:1.5; }}
+  .line {{ width:50px; height:4px; background:#38bdf8; margin-bottom:24px; border-radius:2px; }}
+  ul {{ margin:0; padding-left:22px; color:#e2e8f0; font-size:18px; line-height:1.7; }}
+  li {{ margin-bottom:10px; }}
+</style>
+</head>
+<body>
+  <div class="nav">
+    <button onclick="prev()">❮</button>
+    <span id="counter">1 / 1</span>
+    <button onclick="next()">❯</button>
+  </div>
+  <div class="card">
+    <div class="tag" id="s_tag"></div>
+    <h1 class="title" id="s_title"></h1>
+    <div class="sub" id="s_sub"></div>
+    <div class="line"></div>
+    <ul id="s_list"></ul>
+  </div>
+<script>
+const slides = {slides_json};
+let cur = 0;
+function render() {{
+  const s = slides[cur] || {{}};
+  document.getElementById('counter').innerText = (cur + 1) + ' of ' + slides.length;
+  document.getElementById('s_tag').innerText = s.tag || ('СЛАЙД ' + (cur + 1));
+  document.getElementById('s_title').innerText = s.title || '';
+  document.getElementById('s_sub').innerText = s.subtitle || '';
+  const ul = document.getElementById('s_list');
+  ul.innerHTML = '';
+  (s.points || []).forEach(p => {{
+    const li = document.createElement('li');
+    li.innerText = p;
+    ul.appendChild(li);
+  }});
+}}
+function prev() {{ if (cur > 0) {{ cur--; render(); }} }}
+function next() {{ if (cur < slides.length - 1) {{ cur++; render(); }} }}
+document.addEventListener('keydown', e => {{ if (e.key === 'ArrowRight') next(); if (e.key === 'ArrowLeft') prev(); }});
+render();
+</script>
+</body>
+</html>"""
+    return html_code.encode("utf-8")
 
 @asynccontextmanager
 async def continuous_typing(bot_inst: Bot, chat_id: int, action: str = "typing"):
@@ -315,7 +450,6 @@ def get_main_reply_kb(uid: int = 0):
     kb.button(text="Уровень рассуждений")
     kb.button(text="Инструменты")
     kb.button(text="Новый чат")
-    # Кнопка Админки добавляется СТРОГО только владельцу
     if is_admin(uid):
         kb.button(text="👑 Админка")
         kb.adjust(2, 2, 1)
@@ -441,9 +575,25 @@ async def safe_send(message: types.Message, text: str):
         try:
             await message.answer(html_part, parse_mode="HTML", reply_markup=get_main_reply_kb(uid))
         except Exception:
-            # Если HTML не прошёл — отправляем полностью очищенный от звёздочек и решёток текст
             clean_plain = re.sub(r"<[^>]+>", "", html.unescape(html_part))
             await message.answer(clean_plain, parse_mode=None, reply_markup=get_main_reply_kb(uid))
+
+def is_presentation_request(prompt: str, resp_text: str) -> bool:
+    p_low = prompt.lower()
+    r_low = (resp_text or "").lower()
+    keywords = ["презентац", "повер поинт", "павер поинт", "powerpoint", "pptx", "слайд"]
+    if any(k in p_low for k in keywords):
+        return True
+    if ("презентац" in r_low or "presentation" in r_low) and ("готов" in r_low or "посмотреть" in r_low or "i will now generate" in r_low):
+        return True
+    return False
+
+def is_canvas_stub(resp_text: str) -> bool:
+    if not resp_text:
+        return False
+    r_low = resp_text.lower()
+    stubs = ["i will now generate", "вы можете посмотреть её", "вы можете посмотреть его", "готова! вы можете", "готов! вы можете"]
+    return len(resp_text) < 600 and any(s in r_low for s in stubs)
 
 async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, file_path: str = None):
     global force_quota_lock
@@ -509,8 +659,58 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
                     await message.answer_photo(photo_file, reply_markup=get_main_reply_kb(uid))
                 os.remove(out_path)
 
-    if getattr(response, "text", None):
-        await safe_send(message, response.text)
+    resp_text = getattr(response, "text", "") or ""
+
+    # Если пользователь попросил презентацию или Gemini спрятал презентацию в окно Canvas на сайте:
+    if is_presentation_request(prompt, resp_text):
+        try:
+            extract_prompt = (
+                "Не используй Canvas. Выведи все слайды этой презентации СТРОГО в формате чистого JSON-массива "
+                "(без кавычек ```json и без лишнего текста до и после): "
+                '[{"tag": "ТЕМА РАЗДЕЛА", "title": "Заголовок слайда", "subtitle": "Подзаголовок или краткая суть", "points": ["Пункт 1", "Пункт 2", "Пункт 3"]}]'
+            )
+            slide_resp = await asyncio.wait_for(chat.send_message(extract_prompt), timeout=90)
+            raw_json = (slide_resp.text or "").strip()
+            m_json = re.search(r"\[.*\]", raw_json, flags=re.DOTALL)
+            if m_json:
+                slides_data = json.loads(m_json.group(0))
+                if isinstance(slides_data, list) and len(slides_data) > 0:
+                    pptx_bytes = build_canvas_pptx(slides_data)
+                    html_bytes = build_canvas_html(slides_data)
+
+                    pptx_doc = types.BufferedInputFile(pptx_bytes, filename="Presentation.pptx")
+                    html_doc = types.BufferedInputFile(html_bytes, filename="Presentation_Canvas.html")
+
+                    await message.answer_document(
+                        pptx_doc,
+                        caption="📊 <b>Презентация PowerPoint (.pptx) готова!</b>",
+                        parse_mode="HTML",
+                        reply_markup=get_main_reply_kb(uid)
+                    )
+                    await message.answer_document(
+                        html_doc,
+                        caption="🌐 <b>Интерактивная версия (листается в браузере как в Canvas)</b>",
+                        parse_mode="HTML",
+                        reply_markup=get_main_reply_kb(uid)
+                    )
+                    return
+        except Exception as e:
+            print(f"[!] Ошибка сборки презентации: {e}")
+
+    # Если Gemini спрятал обычный код/текст в окно Canvas и прислал только заглушку «Вы можете посмотреть её»
+    elif is_canvas_stub(resp_text):
+        try:
+            extract_doc = await asyncio.wait_for(
+                chat.send_message("Не открывай Canvas. Выведи полное содержимое только что созданного документа/кода обычным текстом прямо сюда в сообщение."),
+                timeout=90
+            )
+            if getattr(extract_doc, "text", None):
+                resp_text = extract_doc.text
+        except Exception:
+            pass
+
+    if resp_text:
+        await safe_send(message, resp_text)
 
 async def ask_gemini_fallback(user_id: int, new_content, history_text: str):
     global working_api_key
@@ -566,7 +766,6 @@ def create_dispatcher(bot_inst: Bot):
     async def claim_owner(message: types.Message):
         uid = message.from_user.id
         cur_admin = access_db.get("admin_id")
-        # Если админ уже назначен и это кто-то другой — не даём перехватить права
         if cur_admin and int(cur_admin) != int(uid):
             await message.answer("⛔ Владелец бота уже назначен.", reply_markup=get_main_reply_kb(uid))
             return
@@ -709,7 +908,6 @@ def create_dispatcher(bot_inst: Bot):
     async def admin_panel(message: types.Message):
         uid = message.from_user.id
         if not is_admin(uid):
-            # Если не-админ нажал старую закэшированную кнопку — убираем её с его экрана
             await message.answer("⛔ Доступ только для администратора.", reply_markup=get_main_reply_kb(uid))
             return
 
@@ -795,9 +993,9 @@ def create_dispatcher(bot_inst: Bot):
         kb = InlineKeyboardBuilder()
         kb.button(text="🔄 Обновить", callback_data="check_limits")
         try:
-            await call.message.edit_text(report, parse_mode="Markdown", reply_markup=kb.as_markup())
+            await call.message.edit_text(markdown_to_telegram_html(report), parse_mode="HTML", reply_markup=kb.as_markup())
         except Exception:
-            await call.message.answer(report, parse_mode="Markdown", reply_markup=kb.as_markup())
+            await call.message.answer(markdown_to_telegram_html(report), parse_mode="HTML", reply_markup=kb.as_markup())
 
     @d.callback_query(F.data == "reconnect_web")
     async def cb_reconnect_web(call: types.CallbackQuery):
@@ -1013,7 +1211,7 @@ def create_dispatcher(bot_inst: Bot):
     return d
 
 @st.cache_resource
-def launch_bot_v22():
+def launch_bot_v23():
     gen_id = time.time()
     sys._active_tg_gen = gen_id
 
@@ -1050,7 +1248,7 @@ def launch_bot_v22():
     t.start()
     return t
 
-launch_bot_v22()
+launch_bot_v23()
 
 st.title("Gemini Bot")
 st.success("Активен")

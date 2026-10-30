@@ -57,9 +57,9 @@ def _loguru_quota_sink(message):
         raw_ab = text.split("Account abuse status:", 1)[1].strip()
         abuse_status_store = "✅ Чистый (Без ограничений)" if "Clean" in raw_ab else raw_ab
 
-if not getattr(sys, "_quota_sink_v5", False):
+if not getattr(sys, "_quota_sink_v6", False):
     logger.add(_loguru_quota_sink)
-    sys._quota_sink_v5 = True
+    sys._quota_sink_v6 = True
 
 @asynccontextmanager
 async def continuous_typing(bot_inst: Bot, chat_id: int, action: str = "typing"):
@@ -305,30 +305,34 @@ async def delete_old_web_chat(uid: int):
         pass
 
 def resolve_clean_model(client, model_code: str):
+    """Использует ТОЛЬКО живые модели из текущей сессии аккаунта (list_models), чтобы сокет никогда не вис на 35с"""
     code = model_code.lower()
     if hasattr(client, "list_models"):
         try:
             models = client.list_models() or []
-            for m in models:
-                d_name = str(getattr(m, "display_name", "")).lower()
-                m_name = str(getattr(m, "model_name", "")).lower()
-                if code == "flash-lite" and "lite" in (d_name + m_name):
-                    return m
-                if code == "argon" and ("argon" in (d_name + m_name) or "4" in d_name):
-                    return m
-                if code == "pro" and "pro" in (d_name + m_name):
-                    return m
-                if code == "flash" and "flash" in (d_name + m_name) and "lite" not in (d_name + m_name):
-                    return m
+            if models:
+                # 1. Ищем точное совпадение в живых моделях сессии
+                for m in models:
+                    txt = (str(getattr(m, "display_name", "")) + " " + str(getattr(m, "model_name", ""))).lower()
+                    if code == "flash-lite" and "lite" in txt:
+                        return m
+                    if code == "argon" and ("argon" in txt or "4" in txt):
+                        return m
+                    if code == "pro" and "pro" in txt:
+                        return m
+                    if code == "flash" and "flash" in txt and "lite" not in txt:
+                        return m
+                # 2. Если точной подмодели (например lite или argon) нет в живых квотах сессии — берём ближайшую живую (Flash или Pro)!
+                want_pro = code in ("pro", "argon")
+                for m in models:
+                    txt = (str(getattr(m, "display_name", "")) + " " + str(getattr(m, "model_name", ""))).lower()
+                    if want_pro and "pro" in txt:
+                        return m
+                    if not want_pro and "flash" in txt:
+                        return m
+                return models[0]
         except Exception:
             pass
-
-    if hasattr(client, "resolve_model"):
-        for candidate in ([code, "pro"] if code == "argon" else [code]):
-            try:
-                return client.resolve_model(candidate)
-            except Exception:
-                continue
     return None
 
 async def safe_send(message: types.Message, text: str):
@@ -394,7 +398,6 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
     chat = web_chats[uid]
 
     try:
-        # Не ставим короткий таймаут 45с, чтобы внутренний [Recovery] на 48-й секунде спокойно забирал готовый ответ!
         response = await asyncio.wait_for(chat.send_message(clean_prompt, files=files), timeout=110)
         register_chat_cid(uid, chat, response)
     except Exception as e:
@@ -910,7 +913,7 @@ def create_dispatcher(bot_inst: Bot):
     return d
 
 @st.cache_resource
-def launch_bot_v19():
+def launch_bot_v20():
     gen_id = time.time()
     sys._active_tg_gen = gen_id
 
@@ -947,7 +950,7 @@ def launch_bot_v19():
     t.start()
     return t
 
-launch_bot_v19()
+launch_bot_v20()
 
 st.title("Gemini Bot")
 st.success("Активен")

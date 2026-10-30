@@ -15,23 +15,35 @@ from datetime import datetime, timezone, timedelta
 from PIL import Image
 import streamlit as st
 
-try:
-    from gemini_webapi import GeminiClient
-except ImportError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "-U", "gemini-webapi"])
-    from gemini_webapi import GeminiClient
+# Разрешенная папка для автоустановки библиотек без ошибки Permission denied
+TMP_PKGS = "/tmp/pypkgs"
+os.makedirs(TMP_PKGS, exist_ok=True)
+if TMP_PKGS not in sys.path:
+    sys.path.insert(0, TMP_PKGS)
 
 try:
-    import pptx
-    from pptx import Presentation
-    from pptx.util import Inches, Pt
-    from pptx.dml.color import RGBColor
+    from gemini_webapi import GeminiClient
 except ImportError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "-U", "python-pptx"])
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "--target", TMP_PKGS, "-U", "gemini-webapi"])
+    from gemini_webapi import GeminiClient
+
+HAS_PPTX = False
+try:
     import pptx
     from pptx import Presentation
     from pptx.util import Inches, Pt
     from pptx.dml.color import RGBColor
+    HAS_PPTX = True
+except ImportError:
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "--target", TMP_PKGS, "python-pptx"])
+        import pptx
+        from pptx import Presentation
+        from pptx.util import Inches, Pt
+        from pptx.dml.color import RGBColor
+        HAS_PPTX = True
+    except Exception as e:
+        print(f"[!] Не удалось докачать python-pptx: {e}")
 
 try:
     from curl_cffi import CurlHttpVersion
@@ -95,9 +107,9 @@ def _loguru_quota_sink(message):
         raw_ab = text.split("Account abuse status:", 1)[1].strip()
         abuse_status_store = "✅ Чистый (Без ограничений)" if "Clean" in raw_ab else raw_ab
 
-if not getattr(sys, "_quota_sink_v10", False):
+if not getattr(sys, "_quota_sink_v11", False):
     logger.add(_loguru_quota_sink)
-    sys._quota_sink_v10 = True
+    sys._quota_sink_v11 = True
 
 def markdown_to_telegram_html(text: str) -> str:
     code_blocks = []
@@ -133,6 +145,8 @@ def markdown_to_telegram_html(text: str) -> str:
     return text
 
 def build_canvas_pptx(slides_data: list) -> bytes:
+    if not HAS_PPTX:
+        return b""
     prs = Presentation()
     prs.slide_width = Inches(13.333)
     prs.slide_height = Inches(7.5)
@@ -644,7 +658,6 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
     stats_store["web_ok"] += 1
     stats_store["user_reqs"][str(uid)] = stats_store["user_reqs"].get(str(uid), 0) + 1
 
-    # 1. Выгрузка сгенерированных КАРТИНОК (response.images)
     if getattr(response, "images", None) and not is_quota_exhausted():
         for idx, img in enumerate(response.images):
             out_name = f"img_{uid}_{idx}.png"
@@ -656,7 +669,6 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
                     await message.answer_photo(photo_file, reply_markup=get_main_reply_kb(uid))
                 os.remove(out_path)
 
-    # 2. Выгрузка сгенерированных ВИДЕО Veo (response.videos) с автоожиданием рендера
     if getattr(response, "videos", None) and not is_quota_exhausted():
         vid_dir = f"/tmp/vid_{uid}_{int(time.time())}"
         os.makedirs(vid_dir, exist_ok=True)
@@ -674,7 +686,6 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
         finally:
             shutil.rmtree(vid_dir, ignore_errors=True)
 
-    # 3. Выгрузка сгенерированной МУЗЫКИ / АУДИО Lyria (response.media) с автоожиданием рендера
     if getattr(response, "media", None) and not is_quota_exhausted():
         med_dir = f"/tmp/med_{uid}_{int(time.time())}"
         os.makedirs(med_dir, exist_ok=True)
@@ -702,7 +713,6 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
 
     resp_text = getattr(response, "text", "") or ""
 
-    # 4. Сборка презентаций PowerPoint (.pptx + .html), если открылся Canvas
     if is_presentation_request(prompt, resp_text):
         try:
             extract_prompt = (
@@ -719,15 +729,15 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
                     pptx_bytes = build_canvas_pptx(slides_data)
                     html_bytes = build_canvas_html(slides_data)
 
-                    pptx_doc = types.BufferedInputFile(pptx_bytes, filename="Presentation.pptx")
+                    if pptx_bytes:
+                        pptx_doc = types.BufferedInputFile(pptx_bytes, filename="Presentation.pptx")
+                        await message.answer_document(
+                            pptx_doc,
+                            caption="📊 <b>Презентация PowerPoint (.pptx) готова!</b>",
+                            parse_mode="HTML",
+                            reply_markup=get_main_reply_kb(uid)
+                        )
                     html_doc = types.BufferedInputFile(html_bytes, filename="Presentation_Canvas.html")
-
-                    await message.answer_document(
-                        pptx_doc,
-                        caption="📊 <b>Презентация PowerPoint (.pptx) готова!</b>",
-                        parse_mode="HTML",
-                        reply_markup=get_main_reply_kb(uid)
-                    )
                     await message.answer_document(
                         html_doc,
                         caption="🌐 <b>Интерактивная версия (листается в браузере как в Canvas)</b>",
@@ -1251,7 +1261,7 @@ def create_dispatcher(bot_inst: Bot):
     return d
 
 @st.cache_resource
-def launch_bot_v24():
+def launch_bot_v25():
     gen_id = time.time()
     sys._active_tg_gen = gen_id
 
@@ -1288,7 +1298,7 @@ def launch_bot_v24():
     t.start()
     return t
 
-launch_bot_v24()
+launch_bot_v25()
 
 st.title("Gemini Bot")
 st.success("Активен")

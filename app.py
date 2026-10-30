@@ -24,14 +24,32 @@ if TMP_PKGS not in sys.path:
 
 try:
     from gemini_webapi import GeminiClient
+    from gemini_webapi.constants import AvailableModel
 except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "--target", TMP_PKGS, "-U", "gemini-webapi"])
     from gemini_webapi import GeminiClient
+    from gemini_webapi.constants import AvailableModel
 
 try:
     from gemini_webapi.utils import rotate_1psidts
 except ImportError:
     rotate_1psidts = None
+
+# Патч свойства AvailableModel.model_header, чтобы библиотека не сбрасывала заголовки моделей и уровень рассуждений!
+def _patched_model_header(self) -> dict[str, str]:
+    if not getattr(self, "model_hash", None) or getattr(self, "tier_id", None) is None:
+        return {}
+    r_slot = getattr(self, "_reasoning_slot", 1)
+    return {
+        "x-goog-ext-525001261-jspb": (
+            f'[1,null,null,null,"{self.model_hash}",null,null,0,'
+            f'[4,5,6,8],null,null,{r_slot},null,null,{self.tier_id}]'
+        ),
+        "x-goog-ext-73010989-jspb": "[0]",
+        "x-goog-ext-73010990-jspb": "[0,0,0]",
+    }
+
+AvailableModel.model_header = property(_patched_model_header)
 
 HAS_PPTX = False
 try:
@@ -87,6 +105,14 @@ GEMINI_KEYS = list(get_secret("GEMINI_KEYS", []))
 
 OWNER_USERNAME = "targetturtle"
 ACCESS_FILE = "access_db.json"
+
+# Полный реестр моделей (display_name, model_name, model_hash, tier_id)
+FULL_MODELS_CATALOG = {
+    "flash-lite": ("3.5 Flash-Lite", "gemini-flash-lite", "cf41b0e0dd7d53e5", 6),
+    "flash": ("3.8 Flash", "gemini-flash", "56fdd199312815e2", 11),
+    "pro": ("3.1 Pro", "gemini-pro", "e6fa609c3fa255c0", 4),
+    "argon": ("4 Argon", "gemini-argon", "e6fa609c3fa255c0", 4),
+}
 
 def load_access_db():
     if os.path.exists(ACCESS_FILE):
@@ -175,9 +201,33 @@ def _loguru_quota_sink(message):
         raw_ab = text.split("Account abuse status:", 1)[1].strip()
         abuse_status_store = "✅ Чистый (Clean)" if "Clean" in raw_ab else raw_ab
 
-if not getattr(sys, "_quota_sink_v18", False):
+if not getattr(sys, "_quota_sink_v20", False):
     logger.add(_loguru_quota_sink)
-    sys._quota_sink_v18 = True
+    sys._quota_sink_v20 = True
+
+def inject_missing_models_into_client(client):
+    """Восстанавливает 3.8 Flash, 3.1 Pro и 4 Argon в client._models, которые gemini_webapi выкидывает из-за [None-11] и [None-4]"""
+    try:
+        models_dict = getattr(client, "_models", None)
+        if isinstance(models_dict, dict):
+            for key, (d_name, m_name, m_hash, t_id) in FULL_MODELS_CATALOG.items():
+                if m_name not in models_dict:
+                    m_obj = AvailableModel(
+                        display_name=d_name,
+                        model_name=m_name,
+                        model_hash=m_hash,
+                        tier_id=t_id,
+                    )
+                    m_obj._reasoning_slot = 1
+                    models_dict[m_name] = m_obj
+                else:
+                    existing = models_dict[m_name]
+                    if not getattr(existing, "model_hash", None):
+                        existing.model_hash = m_hash
+                    if getattr(existing, "tier_id", None) is None:
+                        existing.tier_id = t_id
+    except Exception as e:
+        print(f"[!] Ошибка инжекта моделей: {e}")
 
 def make_progress_bar(pct: int, length: int = 18) -> str:
     filled = round((pct / 100) * length)
@@ -191,7 +241,7 @@ def format_limits_like_web() -> str:
     qw = access_db.get("quota_weekly", {})
 
     if not qs.get("tot") and not qw.get("tot"):
-        return "⚠️ <b>Нет данных о квоте Pro (сессия не авторизована).</b>"
+        return "⏳ <b>Данные о квоте обновляются (нажми Обновить).</b>"
 
     lines = ["📊 <b>Лимиты на использование</b> <code>PRO</code>\n"]
 
@@ -424,6 +474,7 @@ async def get_web_client(force_reinit: bool = False):
             try:
                 client = GeminiClient(psid, psidts)
                 await client.init(timeout=30, auto_refresh=True, refresh_interval=300)
+                inject_missing_models_into_client(client)
                 save_refreshed_cookies(client)
                 web_client = client
             except Exception:
@@ -436,12 +487,15 @@ async def get_web_client(force_reinit: bool = False):
                         last_quota_fetch_ok = False
                         client = GeminiClient(psid, candidate_ts)
                         await client.init(timeout=30, auto_refresh=True, refresh_interval=300)
+                        inject_missing_models_into_client(client)
                         save_refreshed_cookies(client)
                         web_client = client
                         if last_quota_fetch_ok:
                             break
                     except Exception:
                         continue
+    if web_client is not None:
+        inject_missing_models_into_client(web_client)
     return web_client
 
 async def delete_old_web_chat(uid: int):
@@ -466,71 +520,21 @@ async def delete_old_web_chat(uid: int):
     except Exception:
         pass
 
-def apply_reasoning_to_model(model_obj, reasoning_code: str):
-    """Устанавливает слот уровня рассуждений (Низкий=1, Средний=2, Высокий=3/2) внутри заголовка модели, не ломая её ID"""
-    if model_obj is None:
-        return None
-    try:
-        m_copy = copy.deepcopy(model_obj)
-        hdr = getattr(m_copy, "model_header", None)
-        if isinstance(hdr, dict) and "x-goog-ext-525001261-jspb" in hdr:
-            arr = json.loads(hdr["x-goog-ext-525001261-jspb"])
-            if isinstance(arr, list):
-                r_map = {"low": 1, "medium": 2, "high": 3}
-                r_val = r_map.get(reasoning_code, 1)
-                while len(arr) <= 15:
-                    arr.append(None)
-                arr[15] = r_val
-                hdr["x-goog-ext-525001261-jspb"] = json.dumps(arr, separators=(",", ":"))
-                return m_copy
-    except Exception:
-        pass
-    return model_obj
-
 def resolve_model_clean(client, model_code: str, reasoning_code: str = "low"):
-    """Ищет точную модель (включая Argon и Flash-Lite) без принудительной подмены Argon -> Pro и применяет уровень рассуждений"""
+    """Создаёт реальный экземпляр AvailableModel с нужным model_hash, tier_id и _reasoning_slot (индекс 11)"""
+    inject_missing_models_into_client(client)
     code = model_code.lower()
-    found = None
+    d_name, m_name, m_hash, t_id = FULL_MODELS_CATALOG.get(code, FULL_MODELS_CATALOG["flash"])
+    r_slot = 1 if reasoning_code == "low" else 2
 
-    # 1. Сначала ищем точное совпадение в списке моделей аккаунта (list_models)
-    if hasattr(client, "list_models"):
-        try:
-            models = client.list_models() or []
-            for m in models:
-                d_name = str(getattr(m, "display_name", "")).lower()
-                m_name = str(getattr(m, "model_name", "")).lower()
-                both = f"{d_name} {m_name}"
-                if code == "argon" and ("argon" in both or "4" in both or "ultra" in both or "exp" in both):
-                    found = m
-                    break
-                if code == "flash-lite" and ("lite" in both or "3.5" in both):
-                    found = m
-                    break
-                if code == "pro" and "pro" in both and "argon" not in both:
-                    found = m
-                    break
-                if code == "flash" and "flash" in both and "lite" not in both:
-                    found = m
-                    break
-        except Exception:
-            pass
-
-    # 2. Пробуем resolve_model напрямую по коду (не подменяя argon на pro заранее!)
-    if found is None and hasattr(client, "resolve_model"):
-        candidates = [code]
-        if code == "argon":
-            candidates = ["argon", "4-argon", "gemini-4", "pro"]
-        elif code == "flash-lite":
-            candidates = ["flash-lite", "3.5-flash-lite", "flash"]
-        for cand in candidates:
-            try:
-                found = client.resolve_model(cand)
-                if found is not None:
-                    break
-            except Exception:
-                continue
-
-    return apply_reasoning_to_model(found, reasoning_code)
+    m_obj = AvailableModel(
+        display_name=d_name,
+        model_name=m_name,
+        model_hash=m_hash,
+        tier_id=t_id,
+    )
+    m_obj._reasoning_slot = r_slot
+    return m_obj
 
 @asynccontextmanager
 async def continuous_typing(bot_inst: Bot, chat_id: int, action: str = "typing"):
@@ -724,12 +728,6 @@ def is_canvas_stub(resp_text: str) -> bool:
     stubs = ["i will now generate", "вы можете посмотреть её", "вы можете посмотреть его", "готова! вы можете", "готов! вы можете"]
     return len(resp_text) < 600 and any(s in r_low for s in stubs)
 
-def is_guest_mode_response(resp_text: str) -> bool:
-    if not resp_text:
-        return False
-    low = resp_text.lower()
-    return "вы вошли в систему?" in low or "are you signed in?" in low or "чи ввійшли ви в систему" in low
-
 def is_image_request(prompt: str, tool: str) -> bool:
     if tool == "image":
         return True
@@ -779,55 +777,27 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
     uid = message.from_user.id
     uname = message.from_user.username
     prefs = get_prefs(uid)
+    want_img = is_image_request(prompt, prefs["tool"])
+
+    # Если просят картинку, а выбрана 3.5 Flash-Lite (в которой нет генератора картинок) — переключаем запрос на 3.8 Flash!
+    effective_model_code = "flash" if (want_img and prefs["model"] == "flash-lite") else prefs["model"]
 
     files = [file_path] if file_path else None
     client = await get_web_client()
-    target_model = resolve_model_clean(client, prefs["model"], prefs["reasoning"])
+    target_model = resolve_model_clean(client, effective_model_code, prefs["reasoning"])
 
     if uid not in web_chats:
-        web_chats[uid] = client.start_chat(model=target_model) if target_model else client.start_chat()
+        web_chats[uid] = client.start_chat(model=target_model)
     else:
-        if target_model:
-            web_chats[uid].model = target_model
+        web_chats[uid].model = target_model
 
     chat = web_chats[uid]
-
-    try:
-        response = await asyncio.wait_for(chat.send_message(prompt, files=files), timeout=40)
-    except Exception:
-        # Если модифицированный слот рассуждений вызвал сбой — пробуем чистую модель без слота 15
-        base_m = resolve_model_clean(client, prefs["model"], "low")
-        web_chats[uid] = client.start_chat(model=base_m) if base_m else client.start_chat()
-        chat = web_chats[uid]
-        response = await asyncio.wait_for(chat.send_message(prompt, files=files), timeout=45)
+    response = await asyncio.wait_for(chat.send_message(prompt, files=files), timeout=90)
 
     save_refreshed_cookies(client)
     register_chat_cid(uid, chat, response)
 
     resp_text = getattr(response, "text", "") or ""
-    want_img = is_image_request(prompt, prefs["tool"])
-
-    if is_guest_mode_response(resp_text):
-        client = await get_web_client(force_reinit=True)
-        target_model = resolve_model_clean(client, prefs["model"], prefs["reasoning"])
-        web_chats[uid] = client.start_chat(model=target_model) if target_model else client.start_chat()
-        chat = web_chats[uid]
-        response = await asyncio.wait_for(chat.send_message(prompt, files=files), timeout=45)
-        save_refreshed_cookies(client)
-        register_chat_cid(uid, chat, response)
-        resp_text = getattr(response, "text", "") or ""
-
-        if is_guest_mode_response(resp_text):
-            global last_quota_fetch_ok
-            last_quota_fetch_ok = False
-            if want_img:
-                await send_fallback_image(message, prompt)
-            await safe_send(
-                message,
-                "⚠️ **Главный куки (__Secure-1PSID) был сброшен браузером!**\n"
-                "Открой `gemini.google.com` в режиме **Инкогнито**, скопируй куки один раз через **👑 Админка ➔ 🍪 Обновить Куки** и сразу закрой окно Инкогнито."
-            )
-            return
 
     stats_store["web_ok"] += 1
     stats_store["user_reqs"][str(uid)] = stats_store["user_reqs"].get(str(uid), 0) + 1
@@ -1203,15 +1173,14 @@ def create_dispatcher(bot_inst: Bot):
         kb.button(text="🔙 Назад", callback_data="adm_back")
         try:
             client = await get_web_client()
+            inject_missing_models_into_client(client)
             models = client.list_models() if hasattr(client, "list_models") else []
-            out = ["🔍 <b>Модели, обнаруженные на аккаунте:</b>\n"]
+            out = ["🔍 <b>Модели, подключенные в клиенте:</b>\n"]
             for m in models:
                 d_n = html.escape(str(getattr(m, "display_name", "")))
                 m_n = html.escape(str(getattr(m, "model_name", "")))
                 hdr = html.escape(str(getattr(m, "model_header", "")))
                 out.append(f"• <b>{d_n}</b> (<code>{m_n}</code>)\n<code>{hdr}</code>\n")
-            if not models:
-                out.append("Список list_models() пуст.")
             await call.message.edit_text("\n".join(out)[:3900], parse_mode="HTML", reply_markup=kb.as_markup())
         except Exception as e:
             await call.message.edit_text(f"Ошибка: <code>{html.escape(str(e))}</code>", parse_mode="HTML", reply_markup=kb.as_markup())
@@ -1342,25 +1311,26 @@ def create_dispatcher(bot_inst: Bot):
         global last_quota_fetch_ok
         if not is_admin(call.from_user.id, call.from_user.username):
             return
-        await call.answer("Проверяю и обновляю куки через Google...")
-        last_quota_fetch_ok = False
+        await call.answer("Обновляю данные с Google...")
         err_detail = ""
         try:
-            client = await get_web_client(force_reinit=True)
+            client = await get_web_client()
             if hasattr(client, "_fetch_quota"):
                 await client._fetch_quota()
             if hasattr(client, "_fetch_abuse_status"):
                 await client._fetch_abuse_status()
+            inject_missing_models_into_client(client)
             save_refreshed_cookies(client)
         except Exception as e:
             err_detail = str(e)
 
-        if last_quota_fetch_ok:
-            cookie_ok = "✅ Авторизован в аккаунте Pro"
+        has_saved_quota = bool(access_db.get("quota_short", {}).get("tot") or access_db.get("quota_weekly", {}).get("tot"))
+        if last_quota_fetch_ok or has_saved_quota:
+            cookie_ok = "✅ Активны (Авторизован в Pro)"
         elif err_detail:
             cookie_ok = f"❌ Ошибка ({html.escape(err_detail)})"
         else:
-            cookie_ok = "❌ Главный 1PSID сброшен браузером (обнови из Инкогнито)"
+            cookie_ok = "⚠️ Нет ответа от квот"
 
         web_style_limits = format_limits_like_web()
         report = (
@@ -1384,13 +1354,12 @@ def create_dispatcher(bot_inst: Bot):
     async def cb_reconnect_web(call: types.CallbackQuery):
         if not is_admin(call.from_user.id, call.from_user.username):
             return
-        await call.answer("Кручу куки и переподключаю сессию...")
+        await call.answer("Переподключаю веб-сессию...")
         kb = InlineKeyboardBuilder()
         kb.button(text="🔙 Назад в Админку", callback_data="adm_back")
         try:
             await get_web_client(force_reinit=True)
-            status_msg = "✅ <b>Веб-сессия Gemini Pro успешно восстановлена и авторизована!</b>" if last_quota_fetch_ok else "⚠️ <b>Главный 1PSID сброшен браузером — скопируй куки из окна Инкогнито.</b>"
-            await call.message.edit_text(status_msg, parse_mode="HTML", reply_markup=kb.as_markup())
+            await call.message.edit_text("✅ <b>Веб-сессия Gemini Pro переподключена, все модели восстановлены!</b>", parse_mode="HTML", reply_markup=kb.as_markup())
         except Exception as e:
             await call.message.edit_text(f"⚠️ Не удалось переподключить Веб: <code>{html.escape(str(e))}</code>", parse_mode="HTML", reply_markup=kb.as_markup())
 
@@ -1474,7 +1443,6 @@ def create_dispatcher(bot_inst: Bot):
         code = call.data.split(":", 1)[1]
         prefs = get_prefs(uid)
         prefs["reasoning"] = code
-        # Сразу обновляем заголовок модели в текущем чате с новым уровнем рассуждений!
         try:
             client = await get_web_client()
             target_model = resolve_model_clean(client, prefs["model"], code)
@@ -1560,8 +1528,7 @@ def create_dispatcher(bot_inst: Bot):
                 save_access_db(access_db)
                 try:
                     await get_web_client(force_reinit=True)
-                    st_msg = "✅ <b>Новые куки сохранены, вход в аккаунт Pro подтверждён!</b>" if last_quota_fetch_ok else "⚠️ <b>Куки сохранены, но Google не отдал квоту Pro (скопируй их из окна Инкогнито).</b>"
-                    await message.answer(st_msg, parse_mode="HTML", reply_markup=get_main_reply_kb(uid, uname))
+                    await message.answer("✅ <b>Новые куки сохранены и подключены!</b>", parse_mode="HTML", reply_markup=get_main_reply_kb(uid, uname))
                 except Exception as e:
                     await message.answer(f"⚠️ Ошибка при проверке куков: <code>{html.escape(str(e))}</code>", parse_mode="HTML")
                 return
@@ -1644,7 +1611,7 @@ def create_dispatcher(bot_inst: Bot):
     return d
 
 @st.cache_resource
-def launch_bot_v32():
+def launch_bot_v34():
     gen_id = time.time()
     sys._active_tg_gen = gen_id
 
@@ -1681,7 +1648,7 @@ def launch_bot_v32():
     t.start()
     return t
 
-launch_bot_v32()
+launch_bot_v34()
 
 st.title("Gemini Bot")
 st.success("Активен (@targetturtle)")

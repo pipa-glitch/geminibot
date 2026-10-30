@@ -4,7 +4,6 @@ import io
 import re
 import html
 import json
-import copy
 import time
 import shutil
 import subprocess
@@ -15,7 +14,6 @@ from datetime import datetime, timezone, timedelta
 from PIL import Image
 import streamlit as st
 
-# Разрешенная папка для автоустановки библиотек без ошибки Permission denied
 TMP_PKGS = "/tmp/pypkgs"
 os.makedirs(TMP_PKGS, exist_ok=True)
 if TMP_PKGS not in sys.path:
@@ -42,8 +40,8 @@ except ImportError:
         from pptx.util import Inches, Pt
         from pptx.dml.color import RGBColor
         HAS_PPTX = True
-    except Exception as e:
-        print(f"[!] Не удалось докачать python-pptx: {e}")
+    except Exception:
+        pass
 
 try:
     from curl_cffi import CurlHttpVersion
@@ -78,38 +76,174 @@ TELEGRAM_TOKEN = get_secret("TELEGRAM_TOKEN", "9099534534:AAExrwposBIWvrkBZKbN32
 SECURE_1PSID = get_secret("SECURE_1PSID", "")
 SECURE_1PSIDTS = get_secret("SECURE_1PSIDTS", "")
 GEMINI_KEYS = list(get_secret("GEMINI_KEYS", []))
-MASTER_PIN = str(get_secret("MASTER_PIN", "322"))
 
+OWNER_USERNAME = "targetturtle"
 ACCESS_FILE = "access_db.json"
 
-REAL_WEB_HEADERS = {
-    "flash-lite": ("8c46e95b1a07cecc", 6),
-    "flash": ("56fdd199312815e2", 1),
-    "pro": ("e6fa609c3fa255c0", 3),
-    "argon": ("e6fa609c3fa255c0", 3),
-}
+def load_access_db():
+    if os.path.exists(ACCESS_FILE):
+        try:
+            with open(ACCESS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                data.setdefault("admins", [])
+                data.setdefault("admin_usernames", [OWNER_USERNAME])
+                data.setdefault("preapproved_usernames", {})
+                data.setdefault("open_mode", False)
+                data.setdefault("quota_short", {})
+                data.setdefault("quota_weekly", {})
+                return data
+        except Exception:
+            pass
+    return {
+        "admin_id": None,
+        "admins": [],
+        "admin_usernames": [OWNER_USERNAME],
+        "users": {},
+        "preapproved_usernames": {},
+        "open_mode": False,
+        "custom_psid": "",
+        "custom_psidts": "",
+        "user_cids": {},
+        "quota_short": {},
+        "quota_weekly": {},
+    }
 
-quota_by_model = {}
+def save_access_db(db):
+    try:
+        with open(ACCESS_FILE, "w", encoding="utf-8") as f:
+            json.dump(db, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+access_db = load_access_db()
 force_quota_lock = False
 abuse_status_store = "✅ Чистый (Без ограничений)"
 stats_store = {"web_ok": 0, "fallback_ok": 0, "user_reqs": {}}
+admin_input_state = {}
+
+def parse_utc_reset_to_msk(line: str, is_weekly: bool = False) -> str:
+    tz_msk = timezone(timedelta(hours=3))
+    m_dt = re.search(r"(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})\s*UTC", line)
+    if m_dt:
+        try:
+            dt_utc = datetime.strptime(f"{m_dt.group(1)} {m_dt.group(2)}", "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            dt_msk = dt_utc.astimezone(tz_msk)
+            months_ru = ["", "янв.", "фев.", "мар.", "апр.", "мая", "июн.", "июл.", "авг.", "сент.", "окт.", "нояб.", "дек."]
+            if is_weekly or (dt_msk.date() != datetime.now(tz_msk).date()):
+                return f"{dt_msk.day} {months_ru[dt_msk.month]} в {dt_msk.strftime('%H:%M')}"
+            return dt_msk.strftime("%H:%M")
+        except Exception:
+            pass
+    return ""
 
 def _loguru_quota_sink(message):
     global abuse_status_store, force_quota_lock
     text = str(message).strip()
     if "Account quota updated:" in text:
         info = text.split("Account quota updated:", 1)[1].strip()
-        m_key = info.split("-")[0].strip()
-        quota_by_model[m_key] = info
-        if not check_raw_quota_zero():
-            force_quota_lock = False
+        m_frac = re.search(r"(\d+)\s*/\s*(\d+)", info)
+        if m_frac:
+            rem = int(m_frac.group(1))
+            tot = int(m_frac.group(2))
+            if tot > 0:
+                used_pct = max(0, min(100, round((1 - (rem / tot)) * 100)))
+                # Короткий лимит (tot <= 10000, например 2400) vs Недельный лимит (tot > 10000, например 48384)
+                if tot <= 10000:
+                    access_db["quota_short"] = {
+                        "rem": rem,
+                        "tot": tot,
+                        "pct": used_pct,
+                        "reset": parse_utc_reset_to_msk(info, is_weekly=False),
+                    }
+                else:
+                    access_db["quota_weekly"] = {
+                        "rem": rem,
+                        "tot": tot,
+                        "pct": used_pct,
+                        "reset": parse_utc_reset_to_msk(info, is_weekly=True),
+                    }
+                save_access_db(access_db)
+                if rem > 0:
+                    force_quota_lock = False
     elif "Account abuse status:" in text:
         raw_ab = text.split("Account abuse status:", 1)[1].strip()
         abuse_status_store = "✅ Чистый (Без ограничений)" if "Clean" in raw_ab else raw_ab
 
-if not getattr(sys, "_quota_sink_v11", False):
+if not getattr(sys, "_quota_sink_v13", False):
     logger.add(_loguru_quota_sink)
-    sys._quota_sink_v11 = True
+    sys._quota_sink_v13 = True
+
+def extract_all_quotas_from_client(client):
+    try:
+        raw_dump = str(getattr(client, "__dict__", ""))
+        for m in re.finditer(r"(\d+)\s*/\s*(\d+)", raw_dump):
+            rem, tot = int(m.group(1)), int(m.group(2))
+            if tot <= 0:
+                continue
+            pct = max(0, min(100, round((1 - (rem / tot)) * 100)))
+            if 500 <= tot <= 10000:
+                access_db.setdefault("quota_short", {}).update({"rem": rem, "tot": tot, "pct": pct})
+            elif tot > 10000:
+                access_db.setdefault("quota_weekly", {}).update({"rem": rem, "tot": tot, "pct": pct})
+    except Exception:
+        pass
+
+def check_raw_quota_zero() -> bool:
+    qs = access_db.get("quota_short", {})
+    qw = access_db.get("quota_weekly", {})
+    if qs.get("tot", 0) > 0 and qs.get("rem", 1) <= 0:
+        return True
+    if qw.get("tot", 0) > 0 and qw.get("rem", 1) <= 0:
+        return True
+    return False
+
+def is_quota_exhausted() -> bool:
+    return force_quota_lock or check_raw_quota_zero()
+
+def make_progress_bar(pct: int, length: int = 18) -> str:
+    filled = round((pct / 100) * length)
+    if pct > 0 and filled == 0:
+        filled = 1
+    filled = min(length, max(0, filled))
+    return "█" * filled + "░" * (length - filled)
+
+def format_limits_like_web() -> str:
+    tz_msk = timezone(timedelta(hours=3))
+    now_msk = datetime.now(tz_msk)
+    months_ru = ["", "янв.", "фев.", "мар.", "апр.", "мая", "июн.", "июл.", "авг.", "сент.", "окт.", "нояб.", "дек."]
+
+    qs = access_db.get("quota_short", {})
+    qw = access_db.get("quota_weekly", {})
+
+    cur_pct = 100 if force_quota_lock else qs.get("pct", 0)
+    cur_rem_str = f" ({qs.get('rem')}/{qs.get('tot')})" if qs.get("tot") else ""
+    reset_short = qs.get("reset") or (now_msk + timedelta(hours=4)).strftime("%H:%M")
+
+    if qw.get("tot"):
+        week_pct = qw.get("pct", 0)
+        week_rem_str = f" ({qw.get('rem')}/{qw.get('tot')})"
+        reset_week = qw.get("reset") or f"{(now_msk + timedelta(days=2)).day} {months_ru[(now_msk + timedelta(days=2)).month]}"
+    else:
+        used_credits = (qs.get("tot", 2400) - qs.get("rem", 2400)) if qs.get("tot") else 0
+        week_pct = max(1 if used_credits > 0 else 0, min(100, round((used_credits / 48384) * 100)))
+        week_rem_str = ""
+        w_dt = now_msk + timedelta(days=2)
+        reset_week = f"{w_dt.day} {months_ru[w_dt.month]} в {w_dt.strftime('%H:%M')}"
+
+    bar_cur = make_progress_bar(cur_pct)
+    bar_week = make_progress_bar(week_pct)
+    lock_note = "\n\n⚠️ <b>Лимит исчерпан: активна только 3.5 Flash-Lite без инструментов.</b>" if is_quota_exhausted() else ""
+
+    return (
+        "📊 <b>Лимиты на использование</b> <code>PRO</code>\n"
+        "<i>Обновлено только что (время МСК)</i>\n\n"
+        f"<b>Текущее использование</b> — <b>Использовано {cur_pct} %</b>{cur_rem_str}\n"
+        f"<code>{bar_cur}</code>\n"
+        f"<i>Лимит сбросится: {reset_short}</i>\n\n"
+        f"<b>Недельный лимит</b> — <b>Использовано {week_pct} %</b>{week_rem_str}\n"
+        f"<code>{bar_week}</code>\n"
+        f"<i>Лимит сбросится: {reset_week}</i>" + lock_note
+    )
 
 def markdown_to_telegram_html(text: str) -> str:
     code_blocks = []
@@ -143,6 +277,215 @@ def markdown_to_telegram_html(text: str) -> str:
         text = text.replace(f"@@CODEBLOCK_{idx}@@", b_html)
 
     return text
+
+def sync_user_identity(user: types.User):
+    if not user:
+        return
+    uid = user.id
+    uname = (user.username or "").lower().lstrip("@")
+    changed = False
+
+    admin_unames = [u.lower().lstrip("@") for u in access_db.get("admin_usernames", [OWNER_USERNAME])]
+    if uname and (uname == OWNER_USERNAME or uname in admin_unames):
+        if access_db.get("admin_id") is None or uname == OWNER_USERNAME:
+            access_db["admin_id"] = uid
+            changed = True
+        if uid not in access_db.setdefault("admins", []):
+            access_db["admins"].append(uid)
+            changed = True
+
+    pre = access_db.get("preapproved_usernames", {})
+    if uname and uname in pre:
+        exp_val = pre.pop(uname)
+        access_db.setdefault("users", {})[str(uid)] = {
+            "name": f"{user.full_name} (@{user.username})",
+            "expires_at": exp_val,
+        }
+        changed = True
+
+    if changed:
+        save_access_db(access_db)
+
+def is_admin(uid: int, username: str = None) -> bool:
+    if username and username.lower().lstrip("@") in [u.lower().lstrip("@") for u in access_db.get("admin_usernames", [OWNER_USERNAME])]:
+        return True
+    if not uid:
+        return False
+    if access_db.get("admin_id") and int(access_db["admin_id"]) == int(uid):
+        return True
+    return int(uid) in [int(x) for x in access_db.get("admins", [])]
+
+def check_access(user: types.User) -> bool:
+    sync_user_identity(user)
+    if is_admin(user.id, user.username):
+        return True
+    if access_db.get("open_mode", False):
+        return True
+    u_info = access_db.get("users", {}).get(str(user.id))
+    if not u_info:
+        return False
+    exp = u_info.get("expires_at", 0)
+    if exp == 0 or time.time() < exp:
+        return True
+    access_db["users"].pop(str(user.id), None)
+    save_access_db(access_db)
+    return False
+
+def register_chat_cid(uid: int, *objs):
+    cids = access_db.setdefault("user_cids", {}).setdefault(str(uid), [])
+    changed = False
+    for obj in objs:
+        if obj is None:
+            continue
+        cid = getattr(obj, "cid", None)
+        if not cid and getattr(obj, "metadata", None):
+            meta = getattr(obj, "metadata", None)
+            if isinstance(meta, (list, tuple)) and len(meta) > 0:
+                cid = meta[0]
+        if cid and isinstance(cid, str) and cid not in cids:
+            cids.append(cid)
+            changed = True
+    if changed:
+        save_access_db(access_db)
+
+MODELS_LIST = [
+    ("3.5 Flash-Lite", "flash-lite"),
+    ("3.8 Flash", "flash"),
+    ("3.1 Pro", "pro"),
+    ("4 Argon", "argon"),
+]
+
+REASONING_LIST = [
+    ("Низкий", "low"),
+    ("Средний", "medium"),
+    ("Высокий", "high"),
+]
+
+TOOLS_LIST = [
+    ("Без инструмента", "none"),
+    ("🍌 Создание изображений", "image"),
+    ("🎬 Создание видео", "video"),
+    ("🎵 Создание музыки", "music"),
+    ("📝 Canvas", "canvas"),
+    ("🔬 Deep Research", "deep_research"),
+    ("📖 Обучение", "learning"),
+]
+
+web_client = None
+web_init_lock = asyncio.Lock()
+web_chats = {}
+user_history = {}
+user_prefs = {}
+working_api_key = None
+
+def get_prefs(uid: int):
+    if uid not in user_prefs:
+        user_prefs[uid] = {
+            "model": "flash",
+            "model_label": "3.8 Flash",
+            "reasoning": "low",
+            "tool": "none",
+        }
+    return user_prefs[uid]
+
+def enforce_quota_restrictions(uid: int):
+    prefs = get_prefs(uid)
+    if is_quota_exhausted():
+        prefs["model"] = "flash-lite"
+        prefs["model_label"] = "3.5 Flash-Lite"
+        prefs["tool"] = "none"
+    return prefs
+
+def get_main_reply_kb(uid: int = 0, username: str = None):
+    kb = ReplyKeyboardBuilder()
+    kb.button(text="Модель")
+    kb.button(text="Уровень рассуждений")
+    kb.button(text="Инструменты")
+    kb.button(text="Новый чат")
+    if is_admin(uid, username):
+        kb.button(text="👑 Админка")
+        kb.adjust(2, 2, 1)
+    else:
+        kb.adjust(2, 2)
+    return kb.as_markup(resize_keyboard=True)
+
+def get_locked_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📩 Запросить доступ", callback_data="req_access")
+    return kb.as_markup()
+
+def get_active_cookies():
+    psid = access_db.get("custom_psid") or SECURE_1PSID
+    psidts = access_db.get("custom_psidts") or SECURE_1PSIDTS
+    return psid.strip() if psid else "", psidts.strip() if psidts else None
+
+async def get_web_client(force_reinit: bool = False):
+    global web_client
+    psid, psidts = get_active_cookies()
+    if not psid:
+        raise Exception("В Secrets не указан SECURE_1PSID")
+    async with web_init_lock:
+        if force_reinit or web_client is None:
+            client = GeminiClient(psid, psidts)
+            await client.init(timeout=30, auto_refresh=True)
+            extract_all_quotas_from_client(client)
+            web_client = client
+    return web_client
+
+async def delete_old_web_chat(uid: int):
+    old_chat = web_chats.pop(uid, None)
+    if old_chat is not None:
+        register_chat_cid(uid, old_chat)
+
+    saved_cids = list(access_db.get("user_cids", {}).get(str(uid), []))
+    if not saved_cids:
+        return
+
+    try:
+        client = await get_web_client()
+        if hasattr(client, "delete_chat"):
+            for cid in saved_cids:
+                try:
+                    await client.delete_chat(cid)
+                except Exception:
+                    pass
+        access_db.setdefault("user_cids", {})[str(uid)] = []
+        save_access_db(access_db)
+    except Exception:
+        pass
+
+def resolve_model_clean(client, model_code: str):
+    """Использует только официальный метод библиотеки resolve_model, жестко фиксируя выбор на сайте!"""
+    code = model_code.lower()
+    target_alias = "pro" if code in ("pro", "argon") else ("flash-lite" if code == "flash-lite" else "flash")
+    if hasattr(client, "resolve_model"):
+        try:
+            return client.resolve_model(target_alias)
+        except Exception:
+            pass
+    return None
+
+@asynccontextmanager
+async def continuous_typing(bot_inst: Bot, chat_id: int, action: str = "typing"):
+    stop_event = asyncio.Event()
+
+    async def _loop():
+        while not stop_event.is_set():
+            try:
+                await bot_inst.send_chat_action(chat_id=chat_id, action=action)
+            except Exception:
+                pass
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=4.0)
+            except asyncio.TimeoutError:
+                pass
+
+    task = asyncio.create_task(_loop())
+    try:
+        yield
+    finally:
+        stop_event.set()
+        task.cancel()
 
 def build_canvas_pptx(slides_data: list) -> bytes:
     if not HAS_PPTX:
@@ -265,302 +608,11 @@ render();
 </html>"""
     return html_code.encode("utf-8")
 
-@asynccontextmanager
-async def continuous_typing(bot_inst: Bot, chat_id: int, action: str = "typing"):
-    stop_event = asyncio.Event()
-
-    async def _loop():
-        while not stop_event.is_set():
-            try:
-                await bot_inst.send_chat_action(chat_id=chat_id, action=action)
-            except Exception:
-                pass
-            try:
-                await asyncio.wait_for(stop_event.wait(), timeout=4.0)
-            except asyncio.TimeoutError:
-                pass
-
-    task = asyncio.create_task(_loop())
-    try:
-        yield
-    finally:
-        stop_event.set()
-        task.cancel()
-
-def check_raw_quota_zero() -> bool:
-    for line in quota_by_model.values():
-        m_frac = re.search(r"(\d+)\s*/\s*(\d+)", line)
-        if m_frac:
-            rem = int(m_frac.group(1))
-            tot = int(m_frac.group(2))
-            if tot > 0 and rem <= 0:
-                return True
-    return False
-
-def is_quota_exhausted() -> bool:
-    return force_quota_lock or check_raw_quota_zero()
-
-def enforce_quota_restrictions(uid: int):
-    prefs = get_prefs(uid)
-    if is_quota_exhausted():
-        prefs["model"] = "flash-lite"
-        prefs["model_label"] = "3.5 Flash-Lite"
-        prefs["tool"] = "none"
-    return prefs
-
-def make_progress_bar(pct: int, length: int = 18) -> str:
-    filled = round((pct / 100) * length)
-    if pct > 0 and filled == 0:
-        filled = 1
-    filled = min(length, max(0, filled))
-    return "█" * filled + "░" * (length - filled)
-
-def format_limits_like_web() -> str:
-    tz_msk = timezone(timedelta(hours=3))
-    now_msk = datetime.now(tz_msk)
-
-    parsed_items = []
-    for line in quota_by_model.values():
-        m_frac = re.search(r"(\d+)\s*/\s*(\d+)", line)
-        if m_frac:
-            rem = int(m_frac.group(1))
-            tot = int(m_frac.group(2))
-            if tot > 0:
-                used_pct = max(0, min(100, round((1 - (rem / tot)) * 100)))
-                m_time = re.search(r"(\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}|\d{2}:\d{2})", line)
-                reset_str = m_time.group(1) if m_time else ""
-                parsed_items.append((line.split("[")[0].strip(), used_pct, rem, tot, reset_str))
-
-    if not parsed_items:
-        return "⏳ Данные обновляются (нажми Обновить)."
-
-    cur_pct = parsed_items[0][1]
-    week_pct = parsed_items[-1][1] if len(parsed_items) > 1 else cur_pct
-    if force_quota_lock:
-        cur_pct = 100
-
-    reset_short = parsed_items[0][4] or (now_msk + timedelta(hours=5)).strftime("%H:%M")
-    months_ru = ["", "янв.", "фев.", "мар.", "апр.", "мая", "июн.", "июл.", "авг.", "сент.", "окт.", "нояб.", "дек."]
-    week_dt = now_msk + timedelta(days=2)
-    reset_week = parsed_items[-1][4] or f"{week_dt.day} {months_ru[week_dt.month]} в {week_dt.strftime('%H:%M')}"
-
-    bar_cur = make_progress_bar(cur_pct)
-    bar_week = make_progress_bar(week_pct)
-
-    lock_note = "\n⚠️ **Лимит исчерпан: активна только 3.5 Flash-Lite без инструментов.**" if is_quota_exhausted() else ""
-
-    return (
-        "📊 **Лимиты на использование** `PRO`\n"
-        "_Обновлено только что_\n\n"
-        f"**Текущее использование** — **Использовано {cur_pct} %**\n"
-        f"`{bar_cur}`\n"
-        f"_Лимит сбросится в {reset_short}_\n\n"
-        f"**Недельный лимит** — **Использовано {week_pct} %**\n"
-        f"`{bar_week}`\n"
-        f"_Лимит сбросится {reset_week}_" + lock_note
-    )
-
-def load_access_db():
-    if os.path.exists(ACCESS_FILE):
-        try:
-            with open(ACCESS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {"admin_id": None, "users": {}, "custom_psid": "", "custom_psidts": "", "user_cids": {}}
-
-def save_access_db(db):
-    try:
-        with open(ACCESS_FILE, "w", encoding="utf-8") as f:
-            json.dump(db, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
-
-access_db = load_access_db()
-
-def register_chat_cid(uid: int, *objs):
-    cids = access_db.setdefault("user_cids", {}).setdefault(str(uid), [])
-    changed = False
-    for obj in objs:
-        if obj is None:
-            continue
-        cid = getattr(obj, "cid", None)
-        if not cid and getattr(obj, "metadata", None):
-            meta = getattr(obj, "metadata", None)
-            if isinstance(meta, (list, tuple)) and len(meta) > 0:
-                cid = meta[0]
-        if cid and isinstance(cid, str) and cid not in cids:
-            cids.append(cid)
-            changed = True
-    if changed:
-        save_access_db(access_db)
-
-def is_admin(uid: int) -> bool:
-    admin_id = access_db.get("admin_id")
-    if not admin_id or not uid:
-        return False
-    return int(admin_id) == int(uid)
-
-def check_access(uid: int) -> bool:
-    if is_admin(uid):
-        return True
-    u_info = access_db.get("users", {}).get(str(uid))
-    if not u_info:
-        return False
-    exp = u_info.get("expires_at", 0)
-    if exp == 0 or time.time() < exp:
-        return True
-    access_db["users"].pop(str(uid), None)
-    save_access_db(access_db)
-    return False
-
-MODELS_LIST = [
-    ("3.5 Flash-Lite", "flash-lite"),
-    ("3.8 Flash", "flash"),
-    ("3.1 Pro", "pro"),
-    ("4 Argon", "argon"),
-]
-
-REASONING_LIST = [
-    ("Низкий", "low"),
-    ("Средний", "medium"),
-    ("Высокий", "high"),
-]
-
-TOOLS_LIST = [
-    ("Без инструмента", "none"),
-    ("🍌 Создание изображений", "image"),
-    ("🎬 Создание видео", "video"),
-    ("🎵 Создание музыки", "music"),
-    ("📝 Canvas", "canvas"),
-    ("🔬 Deep Research", "deep_research"),
-    ("📖 Обучение", "learning"),
-]
-
-web_client = None
-web_init_lock = asyncio.Lock()
-web_chats = {}
-user_history = {}
-user_prefs = {}
-working_api_key = None
-
-def get_prefs(uid: int):
-    if uid not in user_prefs:
-        user_prefs[uid] = {
-            "model": "flash",
-            "model_label": "3.8 Flash",
-            "reasoning": "low",
-            "tool": "none",
-        }
-    return user_prefs[uid]
-
-def get_main_reply_kb(uid: int = 0):
-    kb = ReplyKeyboardBuilder()
-    kb.button(text="Модель")
-    kb.button(text="Уровень рассуждений")
-    kb.button(text="Инструменты")
-    kb.button(text="Новый чат")
-    if is_admin(uid):
-        kb.button(text="👑 Админка")
-        kb.adjust(2, 2, 1)
-    else:
-        kb.adjust(2, 2)
-    return kb.as_markup(resize_keyboard=True)
-
-def get_locked_kb():
-    kb = InlineKeyboardBuilder()
-    kb.button(text="📩 Запросить доступ", callback_data="req_access")
-    return kb.as_markup()
-
-def get_active_cookies():
-    psid = access_db.get("custom_psid") or SECURE_1PSID
-    psidts = access_db.get("custom_psidts") or SECURE_1PSIDTS
-    return psid.strip() if psid else "", psidts.strip() if psidts else None
-
-def repair_client_models(client):
-    if not hasattr(client, "list_models"):
-        return
-    try:
-        for m in client.list_models() or []:
-            txt = (str(getattr(m, "display_name", "")) + " " + str(getattr(m, "model_name", ""))).lower()
-            if "lite" in txt:
-                m_hash, cat = REAL_WEB_HEADERS["flash-lite"]
-            elif "pro" in txt:
-                m_hash, cat = REAL_WEB_HEADERS["pro"]
-            else:
-                m_hash, cat = REAL_WEB_HEADERS["flash"]
-            hdr = getattr(m, "model_header", None)
-            if isinstance(hdr, dict):
-                hdr["x-goog-ext-525001261-jspb"] = f'[1,null,null,null,"{m_hash}",null,null,0,[4,5,6,8],null,null,2,null,null,{cat},1]'
-                hdr["x-goog-ext-73010989-jspb"] = "[0]"
-                hdr["x-goog-ext-73010990-jspb"] = "[0,0,0]"
-    except Exception:
-        pass
-
-async def get_web_client(force_reinit: bool = False):
-    global web_client
-    psid, psidts = get_active_cookies()
-    if not psid:
-        raise Exception("В Secrets не указан SECURE_1PSID")
-    async with web_init_lock:
-        if force_reinit or web_client is None:
-            client = GeminiClient(psid, psidts)
-            await client.init(timeout=30, auto_refresh=True)
-            repair_client_models(client)
-            web_client = client
-    return web_client
-
-async def delete_old_web_chat(uid: int):
-    old_chat = web_chats.pop(uid, None)
-    if old_chat is not None:
-        register_chat_cid(uid, old_chat)
-
-    saved_cids = list(access_db.get("user_cids", {}).get(str(uid), []))
-    if not saved_cids:
-        return
-
-    try:
-        client = await get_web_client()
-        if hasattr(client, "delete_chat"):
-            for cid in saved_cids:
-                try:
-                    await client.delete_chat(cid)
-                except Exception:
-                    pass
-        access_db.setdefault("user_cids", {})[str(uid)] = []
-        save_access_db(access_db)
-    except Exception:
-        pass
-
-def resolve_clean_model(client, model_code: str, reasoning_code: str = "low"):
-    repair_client_models(client)
-    code = model_code.lower()
-    m_hash, cat = REAL_WEB_HEADERS.get(code, REAL_WEB_HEADERS["flash"])
-    r_slot = 1 if reasoning_code == "low" else 2
-
-    valid_headers = {
-        "x-goog-ext-525001261-jspb": f'[1,null,null,null,"{m_hash}",null,null,0,[4,5,6,8],null,null,2,null,null,{cat},{r_slot}]',
-        "x-goog-ext-73010989-jspb": "[0]",
-        "x-goog-ext-73010990-jspb": "[0,0,0]",
-    }
-
-    if hasattr(client, "list_models"):
-        try:
-            models = client.list_models() or []
-            if models:
-                base_m = copy.deepcopy(models[0])
-                if hasattr(base_m, "model_header") and isinstance(base_m.model_header, dict):
-                    base_m.model_header.clear()
-                    base_m.model_header.update(valid_headers)
-                    return base_m
-        except Exception:
-            pass
-    return None
-
 async def safe_send(message: types.Message, text: str):
     if not text:
         return
     uid = message.from_user.id
+    uname = message.from_user.username
 
     text = re.sub(r"https?://googleusercontent\.com/\S+", "", text)
     text = re.sub(r"(?:^|\s)_[0-9]+\b", "", text).strip()
@@ -575,7 +627,7 @@ async def safe_send(message: types.Message, text: str):
         file_content = re.sub(r"^```[a-zA-Z0-9_-]*\n", "", file_content.strip())
         file_content = re.sub(r"\n```$", "", file_content.strip())
         doc = types.BufferedInputFile(file_content.encode("utf-8"), filename=filename)
-        await message.answer_document(doc, reply_markup=get_main_reply_kb(uid))
+        await message.answer_document(doc, reply_markup=get_main_reply_kb(uid, uname))
         return
 
     max_len = 3800
@@ -583,10 +635,10 @@ async def safe_send(message: types.Message, text: str):
         raw_part = text[i:i + max_len]
         html_part = markdown_to_telegram_html(raw_part)
         try:
-            await message.answer(html_part, parse_mode="HTML", reply_markup=get_main_reply_kb(uid))
+            await message.answer(html_part, parse_mode="HTML", reply_markup=get_main_reply_kb(uid, uname))
         except Exception:
             clean_plain = re.sub(r"<[^>]+>", "", html.unescape(html_part))
-            await message.answer(clean_plain, parse_mode=None, reply_markup=get_main_reply_kb(uid))
+            await message.answer(clean_plain, parse_mode=None, reply_markup=get_main_reply_kb(uid, uname))
 
 def is_presentation_request(prompt: str, resp_text: str) -> bool:
     p_low = prompt.lower()
@@ -608,6 +660,7 @@ def is_canvas_stub(resp_text: str) -> bool:
 async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, file_path: str = None):
     global force_quota_lock
     uid = message.from_user.id
+    uname = message.from_user.username
     prefs = enforce_quota_restrictions(uid)
 
     clean_prompt = prompt
@@ -620,21 +673,19 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
         elif tool == "music":
             clean_prompt = f"Generate music/audio track: {prompt}"
 
+    # Если пользователь спрашивает версию — прямо указываем активную модель
+    if any(w in prompt.lower() for w in ["какая ты версия", "свою версию", "что ты за модель", "какая модель"]):
+        clean_prompt = f"[Системное уведомление: твоя текущая активная модель — Gemini {prefs['model_label']}]. {clean_prompt}"
+
     files = [file_path] if file_path else None
 
     client = await get_web_client()
     prefs = enforce_quota_restrictions(uid)
-    target_model = resolve_clean_model(client, prefs["model"], prefs["reasoning"])
+    target_model = resolve_model_clean(client, prefs["model"])
 
+    # Чат создаётся ВСЕГДА с выбранной моделью без подмешивания старой
     if uid not in web_chats:
         web_chats[uid] = client.start_chat(model=target_model) if target_model else client.start_chat()
-    else:
-        old_chat = web_chats[uid]
-        if target_model:
-            try:
-                web_chats[uid] = client.start_chat(model=target_model, metadata=old_chat.metadata)
-            except Exception:
-                old_chat.model = target_model
 
     chat = web_chats[uid]
 
@@ -646,12 +697,13 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
         if ("quota" in err_s or "limit" in err_s or "429" in err_s) and prefs["model"] != "flash-lite":
             force_quota_lock = True
             prefs = enforce_quota_restrictions(uid)
-            lite_model = resolve_clean_model(client, "flash-lite", "low")
+            lite_model = resolve_model_clean(client, "flash-lite")
             web_chats[uid] = client.start_chat(model=lite_model) if lite_model else client.start_chat()
             response = await asyncio.wait_for(web_chats[uid].send_message(prompt, files=files), timeout=110)
             register_chat_cid(uid, web_chats[uid], response)
         else:
-            web_chats[uid] = client.start_chat()
+            # При сбое — пересоздаём чат с той же моделью
+            web_chats[uid] = client.start_chat(model=target_model) if target_model else client.start_chat()
             response = await asyncio.wait_for(web_chats[uid].send_message(clean_prompt, files=files), timeout=90)
             register_chat_cid(uid, web_chats[uid], response)
 
@@ -666,7 +718,7 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
             if os.path.exists(out_path):
                 with open(out_path, "rb") as f:
                     photo_file = types.BufferedInputFile(f.read(), filename=out_name)
-                    await message.answer_photo(photo_file, reply_markup=get_main_reply_kb(uid))
+                    await message.answer_photo(photo_file, reply_markup=get_main_reply_kb(uid, uname))
                 os.remove(out_path)
 
     if getattr(response, "videos", None) and not is_quota_exhausted():
@@ -680,7 +732,7 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
                 if os.path.isfile(fpath):
                     with open(fpath, "rb") as f:
                         vid_doc = types.BufferedInputFile(f.read(), filename=fname if fname.endswith(".mp4") else f"{fname}.mp4")
-                        await message.answer_video(vid_doc, caption="🎬 <b>Видео готово!</b>", parse_mode="HTML", reply_markup=get_main_reply_kb(uid))
+                        await message.answer_video(vid_doc, caption="🎬 <b>Видео готово!</b>", parse_mode="HTML", reply_markup=get_main_reply_kb(uid, uname))
         except Exception as e:
             print(f"[!] Ошибка сохранения видео: {e}")
         finally:
@@ -699,13 +751,13 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
                         raw_b = f.read()
                     if fname.lower().endswith((".mp3", ".wav", ".ogg", ".m4a")):
                         aud_doc = types.BufferedInputFile(raw_b, filename=fname)
-                        await message.answer_audio(aud_doc, caption="🎵 <b>Музыкальный трек готов!</b>", parse_mode="HTML", reply_markup=get_main_reply_kb(uid))
+                        await message.answer_audio(aud_doc, caption="🎵 <b>Музыкальный трек готов!</b>", parse_mode="HTML", reply_markup=get_main_reply_kb(uid, uname))
                     elif fname.lower().endswith(".mp4"):
                         vid_doc = types.BufferedInputFile(raw_b, filename=fname)
-                        await message.answer_video(vid_doc, caption="🎬 <b>Видео-обложка трека</b>", parse_mode="HTML", reply_markup=get_main_reply_kb(uid))
+                        await message.answer_video(vid_doc, caption="🎬 <b>Видео-обложка трека</b>", parse_mode="HTML", reply_markup=get_main_reply_kb(uid, uname))
                     else:
                         doc_f = types.BufferedInputFile(raw_b, filename=fname)
-                        await message.answer_document(doc_f, reply_markup=get_main_reply_kb(uid))
+                        await message.answer_document(doc_f, reply_markup=get_main_reply_kb(uid, uname))
         except Exception as e:
             print(f"[!] Ошибка сохранения аудио: {e}")
         finally:
@@ -735,14 +787,14 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
                             pptx_doc,
                             caption="📊 <b>Презентация PowerPoint (.pptx) готова!</b>",
                             parse_mode="HTML",
-                            reply_markup=get_main_reply_kb(uid)
+                            reply_markup=get_main_reply_kb(uid, uname)
                         )
                     html_doc = types.BufferedInputFile(html_bytes, filename="Presentation_Canvas.html")
                     await message.answer_document(
                         html_doc,
                         caption="🌐 <b>Интерактивная версия (листается в браузере как в Canvas)</b>",
                         parse_mode="HTML",
-                        reply_markup=get_main_reply_kb(uid)
+                        reply_markup=get_main_reply_kb(uid, uname)
                     )
                     return
         except Exception as e:
@@ -790,7 +842,7 @@ async def ask_gemini_fallback(user_id: int, new_content, history_text: str):
                     contents=full_contents,
                     config=gtypes.GenerateContentConfig(
                         system_instruction=(
-                            f"Сейчас (МСК): {current_time}. "
+                            f"Сейчас (МСК): {current_time}. Твоя модель: Gemini {prefs['model_label']}. "
                             "Пиши математику без $ и без LaTeX (x², √, /). "
                             "Если просят скинуть файлом — начни первую строку с SEND_FILE:имя_файла.расширение"
                         )
@@ -809,49 +861,60 @@ async def ask_gemini_fallback(user_id: int, new_content, history_text: str):
                 continue
     raise Exception(f"Запасные ключи не сработали: {last_err}")
 
+def build_admin_panel_view():
+    users = access_db.get("users", {})
+    open_mode = access_db.get("open_mode", False)
+    mode_str = "🔓 ОТКРЫТ ДЛЯ ВСЕХ" if open_mode else "🔒 ЗАКРЫТЫЙ (По заявкам)"
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📊 Лимиты и Куки", callback_data="check_limits")
+    kb.button(text="➕ Дать доступ по @юзу", callback_data="adm_add_user")
+    kb.button(text="👑 Выдать / Снять Админку", callback_data="adm_manage_admins")
+    kb.button(text=f"Режим: {mode_str}", callback_data="adm_toggle_mode")
+    kb.button(text="📢 Рассылка всем", callback_data="adm_broadcast")
+    kb.button(text="🍪 Обновить Куки", callback_data="adm_set_cookie")
+    kb.button(text="🔄 Переподключить Веб", callback_data="reconnect_web")
+    kb.button(text="🗑 Очистить чаты на сайте", callback_data="wipe_all_chats")
+
+    lines = [
+        "👑 <b>Панель управления (@targetturtle)</b>",
+        f"⚙️ Режим входа: <b>{mode_str}</b>\n",
+    ]
+
+    now = time.time()
+    active_count = 0
+    for uid_str, info in list(users.items()):
+        exp = info.get("expires_at", 0)
+        if exp != 0 and now >= exp:
+            users.pop(uid_str, None)
+            continue
+        active_count += 1
+        reqs = stats_store["user_reqs"].get(uid_str, 0)
+        rem = "♾ Навсегда" if exp == 0 else f"⏳ {int((exp - now) // 60)} мин."
+        u_name = html.escape(info.get("name", uid_str))
+        is_u_adm = "👑 " if int(uid_str) in [int(x) for x in access_db.get("admins", [])] else ""
+        lines.append(f"• {is_u_adm}<b>{u_name}</b> ({rem} | Запросов: {reqs})")
+        kb.button(text=f"❌ Забрать у {info.get('name', uid_str)[:18]}", callback_data=f"revoke:{uid_str}")
+
+    pre = access_db.get("preapproved_usernames", {})
+    if pre:
+        lines.append("\n⏳ <b>Ожидают первого входа по @юзу:</b> " + ", ".join([f"@{k}" for k in pre.keys()]))
+
+    if active_count == 0 and not pre:
+        lines.append("Сейчас активных клиентов нет.")
+
+    save_access_db(access_db)
+    kb.adjust(2, 2, 2, 2, 1)
+    return "\n".join(lines), kb.as_markup()
+
 def create_dispatcher(bot_inst: Bot):
     d = Dispatcher()
-
-    @d.message(Command("owner"))
-    async def claim_owner(message: types.Message):
-        uid = message.from_user.id
-        cur_admin = access_db.get("admin_id")
-        if cur_admin and int(cur_admin) != int(uid):
-            await message.answer("⛔ Владелец бота уже назначен.", reply_markup=get_main_reply_kb(uid))
-            return
-
-        parts = message.text.split()
-        if len(parts) > 1 and parts[1].strip() == MASTER_PIN:
-            access_db["admin_id"] = uid
-            save_access_db(access_db)
-            await message.answer(
-                "👑 <b>Ты назначен Главным Владельцем бота!</b>\n"
-                "Теперь у тебя есть кнопка «👑 Админка», а все посторонние заблокированы.",
-                parse_mode="HTML",
-                reply_markup=get_main_reply_kb(uid)
-            )
-
-    @d.message(Command("setcookie"))
-    async def cmd_setcookie(message: types.Message):
-        if not is_admin(message.from_user.id):
-            return
-        parts = message.text.split()
-        if len(parts) < 2:
-            await message.answer("Формат: <code>/setcookie ТВОЙ_1PSID ТВОЙ_1PSIDTS</code>", parse_mode="HTML")
-            return
-        access_db["custom_psid"] = parts[1].strip()
-        access_db["custom_psidts"] = parts[2].strip() if len(parts) > 2 else ""
-        save_access_db(access_db)
-        try:
-            await get_web_client(force_reinit=True)
-            await message.answer("✅ <b>Новые куки сохранены и подключены!</b>", parse_mode="HTML")
-        except Exception as e:
-            await message.answer(f"⚠️ Куки сохранены, но тест выдал ошибку: <code>{html.escape(str(e))}</code>", parse_mode="HTML")
 
     @d.message(CommandStart())
     async def start_cmd(message: types.Message):
         uid = message.from_user.id
-        if not check_access(uid):
+        uname = message.from_user.username
+        if not check_access(message.from_user):
             await message.answer(
                 "🔒 <b>Доступ к этому боту закрыт.</b>\n\n"
                 "Нажми кнопку ниже, чтобы отправить заявку владельцу:",
@@ -868,19 +931,19 @@ def create_dispatcher(bot_inst: Bot):
             f"Модель: <b>{prefs['model_label']}</b>\n"
             f"Уровень рассуждений: <b>{r_label}</b>",
             parse_mode="HTML",
-            reply_markup=get_main_reply_kb(uid)
+            reply_markup=get_main_reply_kb(uid, uname)
         )
 
     @d.callback_query(F.data == "req_access")
     async def cb_req_access(call: types.CallbackQuery):
         uid = call.from_user.id
-        if check_access(uid):
+        if check_access(call.from_user):
             await call.answer("У тебя уже есть доступ!")
             return
 
-        admin_id = access_db.get("admin_id")
-        if not admin_id:
-            await call.answer("Владелец ещё не активировал админку (/owner 322).", show_alert=True)
+        admin_targets = list(set(([access_db["admin_id"]] if access_db.get("admin_id") else []) + access_db.get("admins", [])))
+        if not admin_targets:
+            await call.answer("Ожидай входа владельца @targetturtle.", show_alert=True)
             return
 
         u_name = html.escape(call.from_user.full_name or "Без имени")
@@ -890,23 +953,29 @@ def create_dispatcher(bot_inst: Bot):
         kb.button(text="⏱ На 1 час (Урок)", callback_data=f"grant:{uid}:3600")
         kb.button(text="📅 На 1 день (24ч)", callback_data=f"grant:{uid}:86400")
         kb.button(text="♾ Навсегда", callback_data=f"grant:{uid}:0")
+        kb.button(text="👑 Сделать Админом", callback_data=f"makeadm:{uid}")
         kb.button(text="❌ Отказать", callback_data=f"deny:{uid}")
-        kb.adjust(2, 1, 1)
+        kb.adjust(2, 1, 1, 1)
 
-        await bot_inst.send_message(
-            admin_id,
-            f"🔔 <b>Заявка на доступ!</b>\n"
-            f"👤 Имя: {u_name} ({u_nick})\n"
-            f"🆔 ID: <code>{uid}</code>",
-            parse_mode="HTML",
-            reply_markup=kb.as_markup()
-        )
-        await call.answer("Заявка отправлена владельцу!")
-        await call.message.edit_text("⏳ <b>Заявка отправлена!</b> Ожидай подтверждения от владельца.", parse_mode="HTML")
+        for adm_id in admin_targets:
+            try:
+                await bot_inst.send_message(
+                    int(adm_id),
+                    f"🔔 <b>Заявка на доступ!</b>\n"
+                    f"👤 Имя: {u_name} ({u_nick})\n"
+                    f"🆔 ID: <code>{uid}</code>",
+                    parse_mode="HTML",
+                    reply_markup=kb.as_markup()
+                )
+            except Exception:
+                pass
+
+        await call.answer("Заявка отправлена!")
+        await call.message.edit_text("⏳ <b>Заявка отправлена владельцу!</b> Ожидай подтверждения.", parse_mode="HTML")
 
     @d.callback_query(F.data.startswith("grant:"))
     async def cb_grant(call: types.CallbackQuery):
-        if not is_admin(call.from_user.id):
+        if not is_admin(call.from_user.id, call.from_user.username):
             return
         _, target_uid_str, seconds_str = call.data.split(":")
         target_uid = int(target_uid_str)
@@ -916,8 +985,10 @@ def create_dispatcher(bot_inst: Bot):
         try:
             chat_info = await bot_inst.get_chat(target_uid)
             name_label = f"{chat_info.full_name} (@{chat_info.username})" if chat_info.username else chat_info.full_name
+            t_uname = chat_info.username
         except Exception:
             name_label = f"User {target_uid_str}"
+            t_uname = None
 
         access_db.setdefault("users", {})[target_uid_str] = {
             "name": name_label,
@@ -937,6 +1008,27 @@ def create_dispatcher(bot_inst: Bot):
                 target_uid,
                 f"🎉 <b>Тебе открыт доступ к боту ({period_text})!</b>\nМожешь писать вопросы или скидывать фото задач 👇",
                 parse_mode="HTML",
+                reply_markup=get_main_reply_kb(target_uid, t_uname)
+            )
+        except Exception:
+            pass
+
+    @d.callback_query(F.data.startswith("makeadm:"))
+    async def cb_makeadm(call: types.CallbackQuery):
+        if not is_admin(call.from_user.id, call.from_user.username):
+            return
+        target_uid = int(call.data.split(":")[1])
+        if target_uid not in access_db.setdefault("admins", []):
+            access_db["admins"].append(target_uid)
+        access_db.setdefault("users", {})[str(target_uid)] = {"name": f"Admin {target_uid}", "expires_at": 0}
+        save_access_db(access_db)
+        await call.answer("Назначен админом!")
+        await call.message.edit_text(f"👑 Пользователь <code>{target_uid}</code> назначен <b>Администратором</b>!", parse_mode="HTML")
+        try:
+            await bot_inst.send_message(
+                target_uid,
+                "👑 <b>Тебе выданы права Администратора бота!</b>",
+                parse_mode="HTML",
                 reply_markup=get_main_reply_kb(target_uid)
             )
         except Exception:
@@ -944,7 +1036,7 @@ def create_dispatcher(bot_inst: Bot):
 
     @d.callback_query(F.data.startswith("deny:"))
     async def cb_deny(call: types.CallbackQuery):
-        if not is_admin(call.from_user.id):
+        if not is_admin(call.from_user.id, call.from_user.username):
             return
         target_uid = int(call.data.split(":")[1])
         await call.answer("Отклонено")
@@ -956,42 +1048,116 @@ def create_dispatcher(bot_inst: Bot):
 
     @d.message(F.text == "👑 Админка")
     async def admin_panel(message: types.Message):
+        sync_user_identity(message.from_user)
         uid = message.from_user.id
-        if not is_admin(uid):
-            await message.answer("⛔ Доступ только для администратора.", reply_markup=get_main_reply_kb(uid))
+        uname = message.from_user.username
+        if not is_admin(uid, uname):
+            await message.answer("⛔ Доступ только для администратора.", reply_markup=get_main_reply_kb(uid, uname))
             return
 
-        users = access_db.get("users", {})
-        kb = InlineKeyboardBuilder()
-        kb.button(text="📊 Лимиты и проверка Куки", callback_data="check_limits")
-        kb.button(text="🔄 Переподключить Веб-Gemini", callback_data="reconnect_web")
-        kb.button(text="🗑 Очистить ВСЕ чаты на сайте", callback_data="wipe_all_chats")
+        admin_input_state.pop(uid, None)
+        text, markup = build_admin_panel_view()
+        await message.answer(text, parse_mode="HTML", reply_markup=markup)
 
-        lines = ["👑 <b>Админ-панель</b>\n"]
-        now = time.time()
-        active_count = 0
-        for uid_str, info in list(users.items()):
-            exp = info.get("expires_at", 0)
-            if exp != 0 and now >= exp:
-                users.pop(uid_str, None)
-                continue
-            active_count += 1
-            reqs = stats_store["user_reqs"].get(uid_str, 0)
-            rem = "♾ Навсегда" if exp == 0 else f"⏳ {int((exp - now) // 60)} мин."
-            u_name = html.escape(info.get("name", uid_str))
-            lines.append(f"• <b>{u_name}</b> ({rem} | Запросов: {reqs})")
-            kb.button(text=f"❌ Забрать у {info.get('name', uid_str)[:18]}", callback_data=f"revoke:{uid_str}")
+    @d.callback_query(F.data == "adm_back")
+    async def cb_adm_back(call: types.CallbackQuery):
+        if not is_admin(call.from_user.id, call.from_user.username):
+            return
+        admin_input_state.pop(call.from_user.id, None)
+        text, markup = build_admin_panel_view()
+        await call.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
 
-        if active_count == 0:
-            lines.append("Сейчас активных клиентов нет.")
-
+    @d.callback_query(F.data == "adm_toggle_mode")
+    async def cb_adm_toggle_mode(call: types.CallbackQuery):
+        if not is_admin(call.from_user.id, call.from_user.username):
+            return
+        access_db["open_mode"] = not access_db.get("open_mode", False)
         save_access_db(access_db)
+        await call.answer("Режим переключен!")
+        text, markup = build_admin_panel_view()
+        await call.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
+
+    @d.callback_query(F.data == "adm_add_user")
+    async def cb_adm_add_user(call: types.CallbackQuery):
+        if not is_admin(call.from_user.id, call.from_user.username):
+            return
+        admin_input_state[call.from_user.id] = "wait_add_user"
+        kb = InlineKeyboardBuilder()
+        kb.button(text="🔙 Назад", callback_data="adm_back")
+        await call.answer()
+        await call.message.edit_text(
+            "➕ <b>Выдача доступа по @юзу или ID</b>\n\n"
+            "Напиши следующим сообщением <code>@username</code> (или ID) человека, которому нужно открыть доступ:",
+            parse_mode="HTML",
+            reply_markup=kb.as_markup()
+        )
+
+    @d.callback_query(F.data == "adm_manage_admins")
+    async def cb_adm_manage_admins(call: types.CallbackQuery):
+        if not is_admin(call.from_user.id, call.from_user.username):
+            return
+        admin_input_state[call.from_user.id] = "wait_add_admin"
+        cur_adms = access_db.get("admin_usernames", [OWNER_USERNAME])
+        kb = InlineKeyboardBuilder()
+        for u in cur_adms:
+            if u.lower() != OWNER_USERNAME:
+                kb.button(text=f"❌ Снять админа @{u}", callback_data=f"rmadm:{u}")
+        kb.button(text="🔙 Назад", callback_data="adm_back")
         kb.adjust(1)
-        await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=kb.as_markup())
+        await call.answer()
+        await call.message.edit_text(
+            "👑 <b>Управление Администраторами</b>\n\n"
+            f"Текущие админы по юзу: {', '.join(['@' + x for x in cur_adms])}\n\n"
+            "Чтобы назначить нового админа — просто отправь его <code>@username</code> или ID следующим сообщением:",
+            parse_mode="HTML",
+            reply_markup=kb.as_markup()
+        )
+
+    @d.callback_query(F.data.startswith("rmadm:"))
+    async def cb_rmadm(call: types.CallbackQuery):
+        if not is_admin(call.from_user.id, call.from_user.username):
+            return
+        u_to_rm = call.data.split(":", 1)[1].lower()
+        if u_to_rm != OWNER_USERNAME and u_to_rm in access_db.get("admin_usernames", []):
+            access_db["admin_usernames"].remove(u_to_rm)
+            save_access_db(access_db)
+        await call.answer("Админ снят!")
+        await cb_adm_manage_admins(call)
+
+    @d.callback_query(F.data == "adm_broadcast")
+    async def cb_adm_broadcast(call: types.CallbackQuery):
+        if not is_admin(call.from_user.id, call.from_user.username):
+            return
+        admin_input_state[call.from_user.id] = "wait_broadcast"
+        kb = InlineKeyboardBuilder()
+        kb.button(text="🔙 Назад", callback_data="adm_back")
+        await call.answer()
+        await call.message.edit_text(
+            "📢 <b>Рассылка всем пользователям</b>\n\n"
+            "Напиши следующим сообщением текст объявления — бот отправит его всем твоим клиентам:",
+            parse_mode="HTML",
+            reply_markup=kb.as_markup()
+        )
+
+    @d.callback_query(F.data == "adm_set_cookie")
+    async def cb_adm_set_cookie(call: types.CallbackQuery):
+        if not is_admin(call.from_user.id, call.from_user.username):
+            return
+        admin_input_state[call.from_user.id] = "wait_cookie"
+        kb = InlineKeyboardBuilder()
+        kb.button(text="🔙 Назад", callback_data="adm_back")
+        await call.answer()
+        await call.message.edit_text(
+            "🍪 <b>Обновление Куки</b>\n\n"
+            "Отправь следующим сообщением новые куки через пробел:\n"
+            "<code>ТВОЙ_1PSID ТВОЙ_1PSIDTS</code>",
+            parse_mode="HTML",
+            reply_markup=kb.as_markup()
+        )
 
     @d.callback_query(F.data == "wipe_all_chats")
     async def cb_wipe_all_chats(call: types.CallbackQuery):
-        if not is_admin(call.from_user.id):
+        if not is_admin(call.from_user.id, call.from_user.username):
             return
         await call.answer("Удаляю все чаты с сайта Gemini...")
         deleted_count = 0
@@ -1012,13 +1178,19 @@ def create_dispatcher(bot_inst: Bot):
                             except Exception:
                                 pass
             web_chats.clear()
-            await call.message.edit_text(f"🗑 <b>Готово! Удалено чатов с сайта Gemini: {deleted_count}</b>", parse_mode="HTML")
+            kb = InlineKeyboardBuilder()
+            kb.button(text="🔙 Назад в Админку", callback_data="adm_back")
+            await call.message.edit_text(
+                f"🗑 <b>Готово! Удалено чатов с сайта Gemini: {deleted_count}</b>",
+                parse_mode="HTML",
+                reply_markup=kb.as_markup()
+            )
         except Exception as e:
             await call.message.edit_text(f"⚠️ Ошибка при очистке чатов: <code>{html.escape(str(e))}</code>", parse_mode="HTML")
 
     @d.callback_query(F.data == "check_limits")
     async def cb_check_limits(call: types.CallbackQuery):
-        if not is_admin(call.from_user.id):
+        if not is_admin(call.from_user.id, call.from_user.username):
             return
         await call.answer("Обновляю лимиты...")
         cookie_ok = "✅ Активны"
@@ -1026,52 +1198,57 @@ def create_dispatcher(bot_inst: Bot):
             client = await get_web_client(force_reinit=(web_client is None))
             if hasattr(client, "_fetch_quota"):
                 await client._fetch_quota()
-                repair_client_models(client)
             if hasattr(client, "_fetch_abuse_status"):
                 await client._fetch_abuse_status()
+            extract_all_quotas_from_client(client)
         except Exception as e:
-            cookie_ok = f"❌ Сбой ({e})"
+            cookie_ok = f"❌ Сбой ({html.escape(str(e))})"
 
         web_style_limits = format_limits_like_web()
         report = (
             f"{web_style_limits}\n\n"
             "────────────────────\n"
-            f"🍪 **Куки:** {cookie_ok}\n"
-            f"🛡 **Аккаунт:** {abuse_status_store}\n"
-            f"📨 **Запросов:** Веб `{stats_store['web_ok']}` | Запаска `{stats_store['fallback_ok']}`"
+            f"🍪 <b>Куки:</b> {cookie_ok}\n"
+            f"🛡 <b>Аккаунт:</b> {abuse_status_store}\n"
+            f"📨 <b>Запросов:</b> Веб <code>{stats_store['web_ok']}</code> | Запаска <code>{stats_store['fallback_ok']}</code>"
         )
         kb = InlineKeyboardBuilder()
         kb.button(text="🔄 Обновить", callback_data="check_limits")
+        kb.button(text="🔙 Назад", callback_data="adm_back")
+        kb.adjust(2)
         try:
-            await call.message.edit_text(markdown_to_telegram_html(report), parse_mode="HTML", reply_markup=kb.as_markup())
+            await call.message.edit_text(report, parse_mode="HTML", reply_markup=kb.as_markup())
         except Exception:
-            await call.message.answer(markdown_to_telegram_html(report), parse_mode="HTML", reply_markup=kb.as_markup())
+            await call.message.answer(report, parse_mode="HTML", reply_markup=kb.as_markup())
 
     @d.callback_query(F.data == "reconnect_web")
     async def cb_reconnect_web(call: types.CallbackQuery):
         global force_quota_lock
-        if not is_admin(call.from_user.id):
+        if not is_admin(call.from_user.id, call.from_user.username):
             return
         await call.answer("Переподключаю веб-сессию...")
+        kb = InlineKeyboardBuilder()
+        kb.button(text="🔙 Назад в Админку", callback_data="adm_back")
         try:
             force_quota_lock = False
             for uid in list(web_chats.keys()):
                 await delete_old_web_chat(uid)
             await get_web_client(force_reinit=True)
-            await call.message.edit_text("✅ <b>Веб-сессия Gemini Pro успешно переподключена!</b>", parse_mode="HTML")
+            await call.message.edit_text("✅ <b>Веб-сессия Gemini Pro успешно переподключена!</b>", parse_mode="HTML", reply_markup=kb.as_markup())
         except Exception as e:
-            await call.message.edit_text(f"⚠️ Не удалось переподключить Веб: <code>{html.escape(str(e))}</code>", parse_mode="HTML")
+            await call.message.edit_text(f"⚠️ Не удалось переподключить Веб: <code>{html.escape(str(e))}</code>", parse_mode="HTML", reply_markup=kb.as_markup())
 
     @d.callback_query(F.data.startswith("revoke:"))
     async def cb_revoke(call: types.CallbackQuery):
-        if not is_admin(call.from_user.id):
+        if not is_admin(call.from_user.id, call.from_user.username):
             return
         uid_str = call.data.split(":")[1]
         access_db.get("users", {}).pop(uid_str, None)
         save_access_db(access_db)
         await delete_old_web_chat(int(uid_str))
         await call.answer("Доступ закрыт!")
-        await call.message.edit_text(f"🔒 Доступ у пользователя <code>{uid_str}</code> отозван.", parse_mode="HTML")
+        text, markup = build_admin_panel_view()
+        await call.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
         try:
             await bot_inst.send_message(int(uid_str), "🔒 Твой доступ к боту завершён.", reply_markup=types.ReplyKeyboardRemove())
         except Exception:
@@ -1081,16 +1258,16 @@ def create_dispatcher(bot_inst: Bot):
     @d.message(Command("clear"))
     async def clear_cmd(message: types.Message):
         uid = message.from_user.id
-        if not check_access(uid):
+        if not check_access(message.from_user):
             return
         await delete_old_web_chat(uid)
         user_history[uid] = []
-        await message.answer("Старый чат удалён с сайта, начат новый.", reply_markup=get_main_reply_kb(uid))
+        await message.answer("Старый чат удалён с сайта, начат новый.", reply_markup=get_main_reply_kb(uid, message.from_user.username))
 
     @d.message(F.text == "Модель")
     async def menu_models(message: types.Message):
         uid = message.from_user.id
-        if not check_access(uid):
+        if not check_access(message.from_user):
             return
         prefs = enforce_quota_restrictions(uid)
         cur = prefs["model"]
@@ -1113,7 +1290,7 @@ def create_dispatcher(bot_inst: Bot):
     @d.callback_query(F.data.startswith("model:"))
     async def cb_model(call: types.CallbackQuery):
         uid = call.from_user.id
-        if not check_access(uid):
+        if not check_access(call.from_user):
             return
         if is_quota_exhausted():
             enforce_quota_restrictions(uid)
@@ -1121,16 +1298,16 @@ def create_dispatcher(bot_inst: Bot):
             return
         _, code, label = call.data.split(":", 2)
         prefs = get_prefs(uid)
-        if prefs["model"] != code:
-            prefs["model"] = code
-            prefs["model_label"] = label
-            await delete_old_web_chat(uid)
+        prefs["model"] = code
+        prefs["model_label"] = label
+        # Принудительно удаляем старый диалог с сервера Google, чтобы новый чат создался именно с новой моделью!
+        await delete_old_web_chat(uid)
         await call.answer()
         await call.message.edit_text(f"Модель: <b>{label}</b>", parse_mode="HTML")
 
     @d.message(F.text == "Уровень рассуждений")
     async def menu_reasoning(message: types.Message):
-        if not check_access(message.from_user.id):
+        if not check_access(message.from_user):
             return
         cur = get_prefs(message.from_user.id)["reasoning"]
         kb = InlineKeyboardBuilder()
@@ -1142,7 +1319,7 @@ def create_dispatcher(bot_inst: Bot):
 
     @d.callback_query(F.data.startswith("reason:"))
     async def cb_reason(call: types.CallbackQuery):
-        if not check_access(call.from_user.id):
+        if not check_access(call.from_user):
             return
         code = call.data.split(":", 1)[1]
         get_prefs(call.from_user.id)["reasoning"] = code
@@ -1153,7 +1330,7 @@ def create_dispatcher(bot_inst: Bot):
     @d.message(F.text == "Инструменты")
     async def menu_tools(message: types.Message):
         uid = message.from_user.id
-        if not check_access(uid):
+        if not check_access(message.from_user):
             return
         prefs = enforce_quota_restrictions(uid)
         cur = prefs["tool"]
@@ -1172,7 +1349,7 @@ def create_dispatcher(bot_inst: Bot):
     @d.callback_query(F.data.startswith("tool:"))
     async def cb_tool(call: types.CallbackQuery):
         uid = call.from_user.id
-        if not check_access(uid):
+        if not check_access(call.from_user):
             return
         if is_quota_exhausted():
             enforce_quota_restrictions(uid)
@@ -1187,9 +1364,55 @@ def create_dispatcher(bot_inst: Bot):
     @d.message(F.text)
     async def handle_text(message: types.Message):
         uid = message.from_user.id
-        if not check_access(uid):
+        uname = message.from_user.username
+        if not check_access(message.from_user):
             await message.answer("🔒 Доступ закрыт. Отправь заявку владельцу:", reply_markup=get_locked_kb())
             return
+
+        if is_admin(uid, uname) and uid in admin_input_state:
+            mode = admin_input_state.pop(uid)
+            val = message.text.strip()
+            if mode == "wait_add_user":
+                clean_u = val.lstrip("@").lower()
+                if clean_u.isdigit():
+                    access_db.setdefault("users", {})[clean_u] = {"name": f"ID {clean_u}", "expires_at": 0}
+                else:
+                    access_db.setdefault("preapproved_usernames", {})[clean_u] = 0
+                save_access_db(access_db)
+                await message.answer(f"✅ Доступ для <b>@{clean_u}</b> открыт!", parse_mode="HTML", reply_markup=get_main_reply_kb(uid, uname))
+                return
+            elif mode == "wait_add_admin":
+                clean_u = val.lstrip("@").lower()
+                if clean_u.isdigit():
+                    if int(clean_u) not in access_db.setdefault("admins", []):
+                        access_db["admins"].append(int(clean_u))
+                else:
+                    if clean_u not in access_db.setdefault("admin_usernames", []):
+                        access_db["admin_usernames"].append(clean_u)
+                save_access_db(access_db)
+                await message.answer(f"👑 Пользователь <b>@{clean_u}</b> назначен Администратором!", parse_mode="HTML", reply_markup=get_main_reply_kb(uid, uname))
+                return
+            elif mode == "wait_broadcast":
+                sent = 0
+                for target_u in list(access_db.get("users", {}).keys()):
+                    try:
+                        await bot_inst.send_message(int(target_u), f"📢 <b>Сообщение от администратора:</b>\n\n{html.escape(val)}", parse_mode="HTML")
+                        sent += 1
+                    except Exception:
+                        pass
+                await message.answer(f"✅ Рассылка отправлена ({sent} чел.)!", reply_markup=get_main_reply_kb(uid, uname))
+                return
+            elif mode == "wait_cookie":
+                parts = val.split()
+                access_db["custom_psid"] = parts[0].strip()
+                access_db["custom_psidts"] = parts[1].strip() if len(parts) > 1 else ""
+                save_access_db(access_db)
+                try:
+                    await get_web_client(force_reinit=True)
+                    await message.answer("✅ <b>Новые куки сохранены и подключены!</b>", parse_mode="HTML", reply_markup=get_main_reply_kb(uid, uname))
+                except Exception as e:
+                    await message.answer(f"⚠️ Куки сохранены, но тест выдал ошибку: <code>{html.escape(str(e))}</code>", parse_mode="HTML")
+                return
 
         async with continuous_typing(bot_inst, message.chat.id, "typing"):
             try:
@@ -1200,12 +1423,13 @@ def create_dispatcher(bot_inst: Bot):
                     warn = f"⚠️ [Запасной API ({used_model}) | Веб: {web_err}]\n\n"
                     await safe_send(message, warn + ans)
                 except Exception as e:
-                    await message.answer(f"Ошибка: {e}", reply_markup=get_main_reply_kb(uid))
+                    await message.answer(f"Ошибка: {e}", reply_markup=get_main_reply_kb(uid, uname))
 
     @d.message(F.photo)
     async def handle_photo(message: types.Message):
         uid = message.from_user.id
-        if not check_access(uid):
+        uname = message.from_user.username
+        if not check_access(message.from_user):
             await message.answer("🔒 Доступ закрыт. Отправь заявку владельцу:", reply_markup=get_locked_kb())
             return
 
@@ -1229,7 +1453,7 @@ def create_dispatcher(bot_inst: Bot):
                     warn = f"⚠️ [Запасной API ({used_model}) | Веб: {web_err}]\n\n"
                     await safe_send(message, warn + ans)
             except Exception as e:
-                await message.answer(f"Ошибка: {e}", reply_markup=get_main_reply_kb(uid))
+                await message.answer(f"Ошибка: {e}", reply_markup=get_main_reply_kb(uid, uname))
             finally:
                 if os.path.exists(temp_path):
                     os.remove(temp_path)
@@ -1237,7 +1461,8 @@ def create_dispatcher(bot_inst: Bot):
     @d.message(F.document)
     async def handle_document(message: types.Message):
         uid = message.from_user.id
-        if not check_access(uid):
+        uname = message.from_user.username
+        if not check_access(message.from_user):
             await message.answer("🔒 Доступ закрыт. Отправь заявку владельцу:", reply_markup=get_locked_kb())
             return
 
@@ -1253,7 +1478,7 @@ def create_dispatcher(bot_inst: Bot):
                 caption = message.caption or "Проанализируй файл."
                 await ask_gemini_web(bot_inst, message, caption, file_path=temp_path)
             except Exception as e:
-                await message.answer(f"Ошибка файла: {e}", reply_markup=get_main_reply_kb(uid))
+                await message.answer(f"Ошибка файла: {e}", reply_markup=get_main_reply_kb(uid, uname))
             finally:
                 if os.path.exists(temp_path):
                     os.remove(temp_path)
@@ -1261,7 +1486,7 @@ def create_dispatcher(bot_inst: Bot):
     return d
 
 @st.cache_resource
-def launch_bot_v25():
+def launch_bot_v27():
     gen_id = time.time()
     sys._active_tg_gen = gen_id
 
@@ -1298,7 +1523,7 @@ def launch_bot_v25():
     t.start()
     return t
 
-launch_bot_v25()
+launch_bot_v27()
 
 st.title("Gemini Bot")
-st.success("Активен")
+st.success("Активен (@targetturtle)")

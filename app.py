@@ -27,6 +27,11 @@ except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "--target", TMP_PKGS, "-U", "gemini-webapi"])
     from gemini_webapi import GeminiClient
 
+try:
+    from gemini_webapi.utils import rotate_1psidts
+except ImportError:
+    rotate_1psidts = None
+
 HAS_PPTX = False
 try:
     import pptx
@@ -169,9 +174,9 @@ def _loguru_quota_sink(message):
         raw_ab = text.split("Account abuse status:", 1)[1].strip()
         abuse_status_store = "✅ Чистый (Clean)" if "Clean" in raw_ab else raw_ab
 
-if not getattr(sys, "_quota_sink_v16", False):
+if not getattr(sys, "_quota_sink_v17", False):
     logger.add(_loguru_quota_sink)
-    sys._quota_sink_v16 = True
+    sys._quota_sink_v17 = True
 
 def make_progress_bar(pct: int, length: int = 18) -> str:
     filled = round((pct / 100) * length)
@@ -185,7 +190,7 @@ def format_limits_like_web() -> str:
     qw = access_db.get("quota_weekly", {})
 
     if not qs.get("tot") and not qw.get("tot"):
-        return "⚠️ <b>Нет данных о квоте Pro (возможно, куки разлогинились в гостевой режим).</b>"
+        return "⚠️ <b>Нет данных о квоте Pro (сессия не авторизована).</b>"
 
     lines = ["📊 <b>Лимиты на использование</b> <code>PRO</code>\n"]
 
@@ -392,6 +397,22 @@ def save_refreshed_cookies(client):
     except Exception:
         pass
 
+# Автоматическое получение свежего __Secure-1PSIDTS по вечному __Secure-1PSID без участия пользователя!
+async def auto_rotate_cookie_ts(psid: str, old_psidts: str = None):
+    if not rotate_1psidts or not psid:
+        return None
+    for payload in ([{"__Secure-1PSID": psid, "__Secure-1PSIDTS": old_psidts}, {"__Secure-1PSID": psid}] if old_psidts else [{"__Secure-1PSID": psid}]):
+        try:
+            res = rotate_1psidts(payload)
+            new_ts = (await res) if asyncio.iscoroutine(res) else res
+            if new_ts and isinstance(new_ts, str):
+                access_db["custom_psidts"] = new_ts
+                save_access_db(access_db)
+                return new_ts
+        except Exception:
+            continue
+    return None
+
 async def get_web_client(force_reinit: bool = False):
     global web_client, last_quota_fetch_ok
     psid, psidts = get_active_cookies()
@@ -400,10 +421,28 @@ async def get_web_client(force_reinit: bool = False):
     async with web_init_lock:
         if force_reinit or web_client is None:
             last_quota_fetch_ok = False
-            client = GeminiClient(psid, psidts)
-            await client.init(timeout=30, auto_refresh=True)
-            save_refreshed_cookies(client)
-            web_client = client
+            try:
+                client = GeminiClient(psid, psidts)
+                await client.init(timeout=30, auto_refresh=True, refresh_interval=300)
+                save_refreshed_cookies(client)
+                web_client = client
+            except Exception:
+                web_client = None
+
+            # Если старый 1PSIDTS протух (не отдал квоту Pro) — АВТОМАТИЧЕСКИ крутим куки через RotateCookies!
+            if not last_quota_fetch_ok or web_client is None:
+                rotated_ts = await auto_rotate_cookie_ts(psid, psidts)
+                for candidate_ts in ([rotated_ts, None] if rotated_ts else [None]):
+                    try:
+                        last_quota_fetch_ok = False
+                        client = GeminiClient(psid, candidate_ts)
+                        await client.init(timeout=30, auto_refresh=True, refresh_interval=300)
+                        save_refreshed_cookies(client)
+                        web_client = client
+                        if last_quota_fetch_ok:
+                            break
+                    except Exception:
+                        continue
     return web_client
 
 async def delete_old_web_chat(uid: int):
@@ -429,9 +468,7 @@ async def delete_old_web_chat(uid: int):
         pass
 
 def resolve_model_clean(client, model_code: str):
-    """Использует только живые каналы аккаунта (flash / pro), НЕ вызывая мёртвый статический flash-lite, который вешает сокет в TimeoutError!"""
     code = model_code.lower()
-    # На Pro-аккаунтах в gemini-webapi живые сокеты есть только у 'pro' и 'flash'
     target_alias = "pro" if code in ("pro", "argon") else "flash"
     if hasattr(client, "resolve_model"):
         try:
@@ -644,12 +681,10 @@ def is_image_request(prompt: str, tool: str) -> bool:
     p_low = prompt.lower()
     return any(w in p_low for w in ["сгенерируй изображен", "сгенерируй картинк", "нарисуй", "создай картинк", "создай изображен", "кинь картинк"])
 
-# Запасной генератор картинок (если куки слетели или выбрана модель без генератора картинок)
 async def send_fallback_image(message: types.Message, prompt_ru: str):
     uid = message.from_user.id
     uname = message.from_user.username
     prompt_en = prompt_ru
-    # Быстрый перевод промпта на английский через API для точной генерации
     for key in GEMINI_KEYS:
         if not key:
             continue
@@ -705,7 +740,6 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
     try:
         response = await asyncio.wait_for(chat.send_message(prompt, files=files), timeout=40)
     except Exception:
-        # Если заголовок конкретной модели завис — пробуем отправить через дефолтный сокет чата без сброса в API
         web_chats[uid] = client.start_chat()
         chat = web_chats[uid]
         response = await asyncio.wait_for(chat.send_message(prompt, files=files), timeout=45)
@@ -716,23 +750,33 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
     resp_text = getattr(response, "text", "") or ""
     want_img = is_image_request(prompt, prefs["tool"])
 
-    # Если Google вернул гостевой отказ «Вы вошли в систему?»
+    # Если Google ответил «Вы вошли в систему?» — АВТОМАТИЧЕСКИ обновляем 1PSIDTS через RotateCookies и повторяем запрос!
     if is_guest_mode_response(resp_text):
-        global last_quota_fetch_ok
-        last_quota_fetch_ok = False
-        if want_img:
-            await send_fallback_image(message, prompt)
-        await safe_send(
-            message,
-            "⚠️ <b>Веб-куки разлогинились на стороне Google (гостевой режим)!</b>\n"
-            "Обнови куки через <b>👑 Админка ➔ 🍪 Обновить Куки</b>, чтобы чаты снова сохранялись в твоём аккаунте."
-        )
-        return
+        client = await get_web_client(force_reinit=True)
+        target_model = resolve_model_clean(client, prefs["model"])
+        web_chats[uid] = client.start_chat(model=target_model) if target_model else client.start_chat()
+        chat = web_chats[uid]
+        response = await asyncio.wait_for(chat.send_message(prompt, files=files), timeout=45)
+        save_refreshed_cookies(client)
+        register_chat_cid(uid, chat, response)
+        resp_text = getattr(response, "text", "") or ""
+
+        # Если даже после авто-ротации Google не пустил (значит умер сам полугодовой 1PSID)
+        if is_guest_mode_response(resp_text):
+            global last_quota_fetch_ok
+            last_quota_fetch_ok = False
+            if want_img:
+                await send_fallback_image(message, prompt)
+            await safe_send(
+                message,
+                "⚠️ **Главный куки (__Secure-1PSID) был сброшен браузером!**\n"
+                "Открой `gemini.google.com` в режиме **Инкогнито**, скопируй куки один раз через **👑 Админка ➔ 🍪 Обновить Куки** и сразу закрой окно Инкогнито — тогда они больше не будут слетать."
+            )
+            return
 
     stats_store["web_ok"] += 1
     stats_store["user_reqs"][str(uid)] = stats_store["user_reqs"].get(str(uid), 0) + 1
 
-    # 1. Отправка сгенерированных картинок
     sent_any_image = False
     if getattr(response, "images", None):
         for idx, img in enumerate(response.images):
@@ -757,12 +801,10 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
                     except Exception:
                         pass
 
-    # Если пользователь явно просил картинку, а веб-модель вернула только текст без фото — дорисовываем!
     if want_img and not sent_any_image and not getattr(response, "videos", None):
         if await send_fallback_image(message, prompt):
             return
 
-    # 2. Видео (Veo)
     if getattr(response, "videos", None):
         vid_dir = f"/tmp/vid_{uid}_{int(time.time())}"
         os.makedirs(vid_dir, exist_ok=True)
@@ -780,7 +822,6 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
         finally:
             shutil.rmtree(vid_dir, ignore_errors=True)
 
-    # 3. Музыка (Lyria)
     if getattr(response, "media", None):
         med_dir = f"/tmp/med_{uid}_{int(time.time())}"
         os.makedirs(med_dir, exist_ok=True)
@@ -806,7 +847,6 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
         finally:
             shutil.rmtree(med_dir, ignore_errors=True)
 
-    # 4. Презентации PowerPoint (.pptx)
     if is_presentation_request(prompt, resp_text):
         try:
             extract_prompt = (
@@ -1224,11 +1264,11 @@ def create_dispatcher(bot_inst: Bot):
         global last_quota_fetch_ok
         if not is_admin(call.from_user.id, call.from_user.username):
             return
-        await call.answer("Проверяю сессию и лимиты на сервере Google...")
+        await call.answer("Проверяю и обновляю куки через Google...")
         last_quota_fetch_ok = False
         err_detail = ""
         try:
-            client = await get_web_client(force_reinit=(web_client is None))
+            client = await get_web_client(force_reinit=True)
             if hasattr(client, "_fetch_quota"):
                 await client._fetch_quota()
             if hasattr(client, "_fetch_abuse_status"):
@@ -1242,7 +1282,7 @@ def create_dispatcher(bot_inst: Bot):
         elif err_detail:
             cookie_ok = f"❌ Ошибка ({html.escape(err_detail)})"
         else:
-            cookie_ok = "❌ РАЗЛОГИНЕНЫ (Гостевой режим — обнови куки!)"
+            cookie_ok = "❌ Главный 1PSID сброшен браузером (обнови из Инкогнито)"
 
         web_style_limits = format_limits_like_web()
         report = (
@@ -1266,12 +1306,12 @@ def create_dispatcher(bot_inst: Bot):
     async def cb_reconnect_web(call: types.CallbackQuery):
         if not is_admin(call.from_user.id, call.from_user.username):
             return
-        await call.answer("Переподключаю веб-сессию...")
+        await call.answer("Кручу куки и переподключаю сессию...")
         kb = InlineKeyboardBuilder()
         kb.button(text="🔙 Назад в Админку", callback_data="adm_back")
         try:
             await get_web_client(force_reinit=True)
-            status_msg = "✅ <b>Веб-сессия Gemini Pro переподключена!</b>" if last_quota_fetch_ok else "⚠️ <b>Сессия запущена в гостевом режиме (куки устарели, обнови их в Админке).</b>"
+            status_msg = "✅ <b>Веб-сессия Gemini Pro успешно восстановлена и авторизована!</b>" if last_quota_fetch_ok else "⚠️ <b>Главный 1PSID сброшен браузером — скопируй куки из окна Инкогнито.</b>"
             await call.message.edit_text(status_msg, parse_mode="HTML", reply_markup=kb.as_markup())
         except Exception as e:
             await call.message.edit_text(f"⚠️ Не удалось переподключить Веб: <code>{html.escape(str(e))}</code>", parse_mode="HTML", reply_markup=kb.as_markup())
@@ -1432,7 +1472,7 @@ def create_dispatcher(bot_inst: Bot):
                 save_access_db(access_db)
                 try:
                     await get_web_client(force_reinit=True)
-                    st_msg = "✅ <b>Новые куки сохранены, вход в аккаунт Pro подтверждён!</b>" if last_quota_fetch_ok else "⚠️ <b>Куки сохранены, но Google не отдал квоту Pro (проверь __Secure-1PSIDTS).</b>"
+                    st_msg = "✅ <b>Новые куки сохранены, вход в аккаунт Pro подтверждён!</b>" if last_quota_fetch_ok else "⚠️ <b>Куки сохранены, но Google не отдал квоту Pro (скопируй их из окна Инкогнито).</b>"
                     await message.answer(st_msg, parse_mode="HTML", reply_markup=get_main_reply_kb(uid, uname))
                 except Exception as e:
                     await message.answer(f"⚠️ Ошибка при проверке куков: <code>{html.escape(str(e))}</code>", parse_mode="HTML")
@@ -1516,7 +1556,7 @@ def create_dispatcher(bot_inst: Bot):
     return d
 
 @st.cache_resource
-def launch_bot_v30():
+def launch_bot_v31():
     gen_id = time.time()
     sys._active_tg_gen = gen_id
 
@@ -1553,7 +1593,7 @@ def launch_bot_v30():
     t.start()
     return t
 
-launch_bot_v30()
+launch_bot_v31()
 
 st.title("Gemini Bot")
 st.success("Активен (@targetturtle)")

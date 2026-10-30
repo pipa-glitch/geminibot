@@ -2,6 +2,7 @@ import os
 import sys
 import io
 import re
+import html
 import json
 import copy
 import time
@@ -19,7 +20,6 @@ except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "-U", "gemini-webapi"])
     from gemini_webapi import GeminiClient
 
-# Патч HTTP/2 для curl_cffi (чтобы контейнер Streamlit не ронял поток на HTTP/3 QUIC)
 try:
     from curl_cffi import CurlHttpVersion
     from curl_cffi.requests import AsyncSession
@@ -57,7 +57,6 @@ MASTER_PIN = str(get_secret("MASTER_PIN", "322"))
 
 ACCESS_FILE = "access_db.json"
 
-# Настоящие рабочие хэши моделей веб-интерфейса Google (вместо битых [None-11] и [None-4])
 REAL_WEB_HEADERS = {
     "flash-lite": ("8c46e95b1a07cecc", 6),
     "flash": ("56fdd199312815e2", 1),
@@ -83,9 +82,43 @@ def _loguru_quota_sink(message):
         raw_ab = text.split("Account abuse status:", 1)[1].strip()
         abuse_status_store = "✅ Чистый (Без ограничений)" if "Clean" in raw_ab else raw_ab
 
-if not getattr(sys, "_quota_sink_v7", False):
+if not getattr(sys, "_quota_sink_v8", False):
     logger.add(_loguru_quota_sink)
-    sys._quota_sink_v7 = True
+    sys._quota_sink_v8 = True
+
+# Конвертация Markdown со звездочками в чистый HTML для Telegram (без **, * и ###)
+def markdown_to_telegram_html(text: str) -> str:
+    code_blocks = []
+
+    def _save_code_block(match):
+        code = html.escape(match.group(2).strip())
+        code_blocks.append(f"<pre><code>{code}</code></pre>")
+        return f"@@CODEBLOCK_{len(code_blocks) - 1}@@"
+
+    text = re.sub(r"```([a-zA-Z0-9_-]*)\n?(.*?)```", _save_code_block, text, flags=re.DOTALL)
+
+    inline_codes = []
+
+    def _save_inline_code(match):
+        code = html.escape(match.group(1))
+        inline_codes.append(f"<code>{code}</code>")
+        return f"@@INLINECODE_{len(inline_codes) - 1}@@"
+
+    text = re.sub(r"`([^`\n]+)`", _save_inline_code, text)
+
+    text = html.escape(text)
+    text = re.sub(r"(?m)^\s*#{1,6}\s+(.+?)\s*$", r"<b>\1</b>", text)
+    text = re.sub(r"(?m)^\s*[\*\-]\s+", "• ", text)
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text, flags=re.DOTALL)
+    text = re.sub(r"\*([^\*\n]+?)\*", r"<i>\1</i>", text)
+    text = text.replace("**", "")
+
+    for idx, c_html in enumerate(inline_codes):
+        text = text.replace(f"@@INLINECODE_{idx}@@", c_html)
+    for idx, b_html in enumerate(code_blocks):
+        text = text.replace(f"@@CODEBLOCK_{idx}@@", b_html)
+
+    return text
 
 @asynccontextmanager
 async def continuous_typing(bot_inst: Bot, chat_id: int, action: str = "typing"):
@@ -218,7 +251,10 @@ def register_chat_cid(uid: int, *objs):
         save_access_db(access_db)
 
 def is_admin(uid: int) -> bool:
-    return access_db.get("admin_id") == uid
+    admin_id = access_db.get("admin_id")
+    if not admin_id or not uid:
+        return False
+    return int(admin_id) == int(uid)
 
 def check_access(uid: int) -> bool:
     if is_admin(uid):
@@ -279,6 +315,7 @@ def get_main_reply_kb(uid: int = 0):
     kb.button(text="Уровень рассуждений")
     kb.button(text="Инструменты")
     kb.button(text="Новый чат")
+    # Кнопка Админки добавляется СТРОГО только владельцу
     if is_admin(uid):
         kb.button(text="👑 Админка")
         kb.adjust(2, 2, 1)
@@ -297,7 +334,6 @@ def get_active_cookies():
     return psid.strip() if psid else "", psidts.strip() if psidts else None
 
 def repair_client_models(client):
-    """Чинит битые заголовки [None-11] и [None-4] внутри клиента после _fetch_quota"""
     if not hasattr(client, "list_models"):
         return
     try:
@@ -353,7 +389,6 @@ async def delete_old_web_chat(uid: int):
         pass
 
 def resolve_clean_model(client, model_code: str, reasoning_code: str = "low"):
-    """Формирует 100% валидный заголовок модели с настоящим хэшем (без None) и нужным уровнем рассуждений"""
     repair_client_models(client)
     code = model_code.lower()
     m_hash, cat = REAL_WEB_HEADERS.get(code, REAL_WEB_HEADERS["flash"])
@@ -399,13 +434,16 @@ async def safe_send(message: types.Message, text: str):
         await message.answer_document(doc, reply_markup=get_main_reply_kb(uid))
         return
 
-    max_len = 4000
+    max_len = 3800
     for i in range(0, len(text), max_len):
-        part = text[i:i + max_len]
+        raw_part = text[i:i + max_len]
+        html_part = markdown_to_telegram_html(raw_part)
         try:
-            await message.answer(part, parse_mode="Markdown", reply_markup=get_main_reply_kb(uid))
+            await message.answer(html_part, parse_mode="HTML", reply_markup=get_main_reply_kb(uid))
         except Exception:
-            await message.answer(part, parse_mode=None, reply_markup=get_main_reply_kb(uid))
+            # Если HTML не прошёл — отправляем полностью очищенный от звёздочек и решёток текст
+            clean_plain = re.sub(r"<[^>]+>", "", html.unescape(html_part))
+            await message.answer(clean_plain, parse_mode=None, reply_markup=get_main_reply_kb(uid))
 
 async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, file_path: str = None):
     global force_quota_lock
@@ -453,7 +491,6 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
             response = await asyncio.wait_for(web_chats[uid].send_message(prompt, files=files), timeout=110)
             register_chat_cid(uid, web_chats[uid], response)
         else:
-            # Если заголовок модели вызвал сбой — пробуем чистый start_chat() без заголовка модели перед запаской
             web_chats[uid] = client.start_chat()
             response = await asyncio.wait_for(web_chats[uid].send_message(clean_prompt, files=files), timeout=90)
             register_chat_cid(uid, web_chats[uid], response)
@@ -527,15 +564,22 @@ def create_dispatcher(bot_inst: Bot):
 
     @d.message(Command("owner"))
     async def claim_owner(message: types.Message):
+        uid = message.from_user.id
+        cur_admin = access_db.get("admin_id")
+        # Если админ уже назначен и это кто-то другой — не даём перехватить права
+        if cur_admin and int(cur_admin) != int(uid):
+            await message.answer("⛔ Владелец бота уже назначен.", reply_markup=get_main_reply_kb(uid))
+            return
+
         parts = message.text.split()
         if len(parts) > 1 and parts[1].strip() == MASTER_PIN:
-            access_db["admin_id"] = message.from_user.id
+            access_db["admin_id"] = uid
             save_access_db(access_db)
             await message.answer(
-                "👑 **Ты назначен Главным Владельцем бота!**\n"
+                "👑 <b>Ты назначен Главным Владельцем бота!</b>\n"
                 "Теперь у тебя есть кнопка «👑 Админка», а все посторонние заблокированы.",
-                parse_mode="Markdown",
-                reply_markup=get_main_reply_kb(message.from_user.id)
+                parse_mode="HTML",
+                reply_markup=get_main_reply_kb(uid)
             )
 
     @d.message(Command("setcookie"))
@@ -544,25 +588,25 @@ def create_dispatcher(bot_inst: Bot):
             return
         parts = message.text.split()
         if len(parts) < 2:
-            await message.answer("Формат: `/setcookie ТВОЙ_1PSID ТВОЙ_1PSIDTS`", parse_mode="Markdown")
+            await message.answer("Формат: <code>/setcookie ТВОЙ_1PSID ТВОЙ_1PSIDTS</code>", parse_mode="HTML")
             return
         access_db["custom_psid"] = parts[1].strip()
         access_db["custom_psidts"] = parts[2].strip() if len(parts) > 2 else ""
         save_access_db(access_db)
         try:
             await get_web_client(force_reinit=True)
-            await message.answer("✅ **Новые куки сохранены и подключены!**", parse_mode="Markdown")
+            await message.answer("✅ <b>Новые куки сохранены и подключены!</b>", parse_mode="HTML")
         except Exception as e:
-            await message.answer(f"⚠️ Куки сохранены, но тест выдал ошибку: `{e}`", parse_mode="Markdown")
+            await message.answer(f"⚠️ Куки сохранены, но тест выдал ошибку: <code>{html.escape(str(e))}</code>", parse_mode="HTML")
 
     @d.message(CommandStart())
     async def start_cmd(message: types.Message):
         uid = message.from_user.id
         if not check_access(uid):
             await message.answer(
-                "🔒 **Доступ к этому боту закрыт.**\n\n"
+                "🔒 <b>Доступ к этому боту закрыт.</b>\n\n"
                 "Нажми кнопку ниже, чтобы отправить заявку владельцу:",
-                parse_mode="Markdown",
+                parse_mode="HTML",
                 reply_markup=get_locked_kb()
             )
             return
@@ -572,9 +616,9 @@ def create_dispatcher(bot_inst: Bot):
         prefs = enforce_quota_restrictions(uid)
         r_label = dict((v, k) for k, v in REASONING_LIST).get(prefs["reasoning"], prefs["reasoning"])
         await message.answer(
-            f"Модель: *{prefs['model_label']}*\n"
-            f"Уровень рассуждений: *{r_label}*",
-            parse_mode="Markdown",
+            f"Модель: <b>{prefs['model_label']}</b>\n"
+            f"Уровень рассуждений: <b>{r_label}</b>",
+            parse_mode="HTML",
             reply_markup=get_main_reply_kb(uid)
         )
 
@@ -590,7 +634,7 @@ def create_dispatcher(bot_inst: Bot):
             await call.answer("Владелец ещё не активировал админку (/owner 322).", show_alert=True)
             return
 
-        u_name = call.from_user.full_name or "Без имени"
+        u_name = html.escape(call.from_user.full_name or "Без имени")
         u_nick = f"@{call.from_user.username}" if call.from_user.username else "без юзернейма"
 
         kb = InlineKeyboardBuilder()
@@ -602,25 +646,26 @@ def create_dispatcher(bot_inst: Bot):
 
         await bot_inst.send_message(
             admin_id,
-            f"🔔 **Заявка на доступ!**\n"
+            f"🔔 <b>Заявка на доступ!</b>\n"
             f"👤 Имя: {u_name} ({u_nick})\n"
-            f"🆔 ID: `{uid}`",
-            parse_mode="Markdown",
+            f"🆔 ID: <code>{uid}</code>",
+            parse_mode="HTML",
             reply_markup=kb.as_markup()
         )
         await call.answer("Заявка отправлена владельцу!")
-        await call.message.edit_text("⏳ **Заявка отправлена!** Ожидай подтверждения от владельца.", parse_mode="Markdown")
+        await call.message.edit_text("⏳ <b>Заявка отправлена!</b> Ожидай подтверждения от владельца.", parse_mode="HTML")
 
     @d.callback_query(F.data.startswith("grant:"))
     async def cb_grant(call: types.CallbackQuery):
         if not is_admin(call.from_user.id):
             return
         _, target_uid_str, seconds_str = call.data.split(":")
+        target_uid = int(target_uid_str)
         seconds = int(seconds_str)
         expires_at = (time.time() + seconds) if seconds > 0 else 0
 
         try:
-            chat_info = await bot_inst.get_chat(int(target_uid_str))
+            chat_info = await bot_inst.get_chat(target_uid)
             name_label = f"{chat_info.full_name} (@{chat_info.username})" if chat_info.username else chat_info.full_name
         except Exception:
             name_label = f"User {target_uid_str}"
@@ -633,14 +678,17 @@ def create_dispatcher(bot_inst: Bot):
 
         period_text = "на 1 час" if seconds == 3600 else ("на 24 часа" if seconds == 86400 else "навсегда")
         await call.answer("Доступ выдан!")
-        await call.message.edit_text(f"✅ Доступ для **{name_label}** (`{target_uid_str}`) открыт **{period_text}**!", parse_mode="Markdown")
+        await call.message.edit_text(
+            f"✅ Доступ для <b>{html.escape(name_label)}</b> (<code>{target_uid_str}</code>) открыт <b>{period_text}</b>!",
+            parse_mode="HTML"
+        )
 
         try:
             await bot_inst.send_message(
-                int(target_uid_str),
-                f"🎉 **Тебе открыт доступ к боту ({period_text})!**\nМожешь писать вопросы или скидывать фото задач 👇",
-                parse_mode="Markdown",
-                reply_markup=get_main_reply_kb(int(target_uid_str))
+                target_uid,
+                f"🎉 <b>Тебе открыт доступ к боту ({period_text})!</b>\nМожешь писать вопросы или скидывать фото задач 👇",
+                parse_mode="HTML",
+                reply_markup=get_main_reply_kb(target_uid)
             )
         except Exception:
             pass
@@ -651,7 +699,7 @@ def create_dispatcher(bot_inst: Bot):
             return
         target_uid = int(call.data.split(":")[1])
         await call.answer("Отклонено")
-        await call.message.edit_text(f"❌ Заявка `{target_uid}` отклонена.", parse_mode="Markdown")
+        await call.message.edit_text(f"❌ Заявка <code>{target_uid}</code> отклонена.", parse_mode="HTML")
         try:
             await bot_inst.send_message(target_uid, "❌ Владелец отклонил заявку на доступ.")
         except Exception:
@@ -659,15 +707,19 @@ def create_dispatcher(bot_inst: Bot):
 
     @d.message(F.text == "👑 Админка")
     async def admin_panel(message: types.Message):
-        if not is_admin(message.from_user.id):
+        uid = message.from_user.id
+        if not is_admin(uid):
+            # Если не-админ нажал старую закэшированную кнопку — убираем её с его экрана
+            await message.answer("⛔ Доступ только для администратора.", reply_markup=get_main_reply_kb(uid))
             return
+
         users = access_db.get("users", {})
         kb = InlineKeyboardBuilder()
         kb.button(text="📊 Лимиты и проверка Куки", callback_data="check_limits")
         kb.button(text="🔄 Переподключить Веб-Gemini", callback_data="reconnect_web")
         kb.button(text="🗑 Очистить ВСЕ чаты на сайте", callback_data="wipe_all_chats")
 
-        lines = ["👑 **Админ-панель**\n"]
+        lines = ["👑 <b>Админ-панель</b>\n"]
         now = time.time()
         active_count = 0
         for uid_str, info in list(users.items()):
@@ -678,7 +730,8 @@ def create_dispatcher(bot_inst: Bot):
             active_count += 1
             reqs = stats_store["user_reqs"].get(uid_str, 0)
             rem = "♾ Навсегда" if exp == 0 else f"⏳ {int((exp - now) // 60)} мин."
-            lines.append(f"• **{info.get('name', uid_str)}** ({rem} | Запросов: {reqs})")
+            u_name = html.escape(info.get("name", uid_str))
+            lines.append(f"• <b>{u_name}</b> ({rem} | Запросов: {reqs})")
             kb.button(text=f"❌ Забрать у {info.get('name', uid_str)[:18]}", callback_data=f"revoke:{uid_str}")
 
         if active_count == 0:
@@ -686,7 +739,7 @@ def create_dispatcher(bot_inst: Bot):
 
         save_access_db(access_db)
         kb.adjust(1)
-        await message.answer("\n".join(lines), parse_mode="Markdown", reply_markup=kb.as_markup())
+        await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=kb.as_markup())
 
     @d.callback_query(F.data == "wipe_all_chats")
     async def cb_wipe_all_chats(call: types.CallbackQuery):
@@ -711,9 +764,9 @@ def create_dispatcher(bot_inst: Bot):
                             except Exception:
                                 pass
             web_chats.clear()
-            await call.message.edit_text(f"🗑 **Готово! Удалено чатов с сайта Gemini: {deleted_count}**", parse_mode="Markdown")
+            await call.message.edit_text(f"🗑 <b>Готово! Удалено чатов с сайта Gemini: {deleted_count}</b>", parse_mode="HTML")
         except Exception as e:
-            await call.message.edit_text(f"⚠️ Ошибка при очистке чатов: `{e}`", parse_mode="Markdown")
+            await call.message.edit_text(f"⚠️ Ошибка при очистке чатов: <code>{html.escape(str(e))}</code>", parse_mode="HTML")
 
     @d.callback_query(F.data == "check_limits")
     async def cb_check_limits(call: types.CallbackQuery):
@@ -757,9 +810,9 @@ def create_dispatcher(bot_inst: Bot):
             for uid in list(web_chats.keys()):
                 await delete_old_web_chat(uid)
             await get_web_client(force_reinit=True)
-            await call.message.edit_text("✅ **Веб-сессия Gemini Pro успешно переподключена!**", parse_mode="Markdown")
+            await call.message.edit_text("✅ <b>Веб-сессия Gemini Pro успешно переподключена!</b>", parse_mode="HTML")
         except Exception as e:
-            await call.message.edit_text(f"⚠️ Не удалось переподключить Веб: `{e}`", parse_mode="Markdown")
+            await call.message.edit_text(f"⚠️ Не удалось переподключить Веб: <code>{html.escape(str(e))}</code>", parse_mode="HTML")
 
     @d.callback_query(F.data.startswith("revoke:"))
     async def cb_revoke(call: types.CallbackQuery):
@@ -770,9 +823,9 @@ def create_dispatcher(bot_inst: Bot):
         save_access_db(access_db)
         await delete_old_web_chat(int(uid_str))
         await call.answer("Доступ закрыт!")
-        await call.message.edit_text(f"🔒 Доступ у пользователя `{uid_str}` отозван.", parse_mode="Markdown")
+        await call.message.edit_text(f"🔒 Доступ у пользователя <code>{uid_str}</code> отозван.", parse_mode="HTML")
         try:
-            await bot_inst.send_message(int(uid_str), "🔒 Твой доступ к боту завершён.")
+            await bot_inst.send_message(int(uid_str), "🔒 Твой доступ к боту завершён.", reply_markup=types.ReplyKeyboardRemove())
         except Exception:
             pass
 
@@ -825,7 +878,7 @@ def create_dispatcher(bot_inst: Bot):
             prefs["model_label"] = label
             await delete_old_web_chat(uid)
         await call.answer()
-        await call.message.edit_text(f"Модель: *{label}*", parse_mode="Markdown")
+        await call.message.edit_text(f"Модель: <b>{label}</b>", parse_mode="HTML")
 
     @d.message(F.text == "Уровень рассуждений")
     async def menu_reasoning(message: types.Message):
@@ -847,7 +900,7 @@ def create_dispatcher(bot_inst: Bot):
         get_prefs(call.from_user.id)["reasoning"] = code
         label = dict((v, k) for k, v in REASONING_LIST).get(code, code)
         await call.answer()
-        await call.message.edit_text(f"Уровень рассуждений: *{label}*", parse_mode="Markdown")
+        await call.message.edit_text(f"Уровень рассуждений: <b>{label}</b>", parse_mode="HTML")
 
     @d.message(F.text == "Инструменты")
     async def menu_tools(message: types.Message):
@@ -881,7 +934,7 @@ def create_dispatcher(bot_inst: Bot):
         get_prefs(uid)["tool"] = code
         label = dict((v, k) for k, v in TOOLS_LIST).get(code, code)
         await call.answer()
-        await call.message.edit_text(f"Инструмент: *{label}*", parse_mode="Markdown")
+        await call.message.edit_text(f"Инструмент: <b>{label}</b>", parse_mode="HTML")
 
     @d.message(F.text)
     async def handle_text(message: types.Message):
@@ -960,7 +1013,7 @@ def create_dispatcher(bot_inst: Bot):
     return d
 
 @st.cache_resource
-def launch_bot_v21():
+def launch_bot_v22():
     gen_id = time.time()
     sys._active_tg_gen = gen_id
 
@@ -997,7 +1050,7 @@ def launch_bot_v21():
     t.start()
     return t
 
-launch_bot_v21()
+launch_bot_v22()
 
 st.title("Gemini Bot")
 st.success("Активен")

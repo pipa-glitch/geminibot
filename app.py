@@ -6,6 +6,7 @@ import html
 import json
 import copy
 import time
+import shutil
 import subprocess
 import asyncio
 import threading
@@ -94,9 +95,9 @@ def _loguru_quota_sink(message):
         raw_ab = text.split("Account abuse status:", 1)[1].strip()
         abuse_status_store = "✅ Чистый (Без ограничений)" if "Clean" in raw_ab else raw_ab
 
-if not getattr(sys, "_quota_sink_v9", False):
+if not getattr(sys, "_quota_sink_v10", False):
     logger.add(_loguru_quota_sink)
-    sys._quota_sink_v9 = True
+    sys._quota_sink_v10 = True
 
 def markdown_to_telegram_html(text: str) -> str:
     code_blocks = []
@@ -131,7 +132,6 @@ def markdown_to_telegram_html(text: str) -> str:
 
     return text
 
-# Генератор настоящего файла PowerPoint (.pptx) в стиле Gemini Canvas
 def build_canvas_pptx(slides_data: list) -> bytes:
     prs = Presentation()
     prs.slide_width = Inches(13.333)
@@ -143,14 +143,13 @@ def build_canvas_pptx(slides_data: list) -> bytes:
         bg = slide.background
         fill = bg.fill
         fill.solid()
-        fill.fore_color.rgb = RGBColor(13, 25, 43)  # Тёмно-синий фон как в Canvas
+        fill.fore_color.rgb = RGBColor(13, 25, 43)
 
         tag_text = str(s.get("tag", f"СЛАЙД {idx + 1}")).upper()
         title_text = str(s.get("title", f"Слайд {idx + 1}"))
         subtitle_text = str(s.get("subtitle", ""))
         points = s.get("points", [])
 
-        # Верхний голубой тег
         tb_tag = slide.shapes.add_textbox(Inches(1.0), Inches(1.0), Inches(11.3), Inches(0.5))
         p_tag = tb_tag.text_frame.paragraphs[0]
         p_tag.text = tag_text
@@ -158,7 +157,6 @@ def build_canvas_pptx(slides_data: list) -> bytes:
         p_tag.font.bold = True
         p_tag.font.color.rgb = RGBColor(56, 189, 248)
 
-        # Заголовок слайда
         tb_title = slide.shapes.add_textbox(Inches(1.0), Inches(1.5), Inches(11.3), Inches(1.6))
         tf_title = tb_title.text_frame
         tf_title.word_wrap = True
@@ -168,7 +166,6 @@ def build_canvas_pptx(slides_data: list) -> bytes:
         p_title.font.bold = True
         p_title.font.color.rgb = RGBColor(255, 255, 255)
 
-        # Контент слайда
         tb_body = slide.shapes.add_textbox(Inches(1.0), Inches(3.2), Inches(11.3), Inches(3.6))
         tf_body = tb_body.text_frame
         tf_body.word_wrap = True
@@ -194,7 +191,6 @@ def build_canvas_pptx(slides_data: list) -> bytes:
     prs.save(out_io)
     return out_io.getvalue()
 
-# Генератор интерактивной HTML-презентации (1-в-1 как окно Canvas со стрелочками)
 def build_canvas_html(slides_data: list) -> bytes:
     slides_json = json.dumps(slides_data, ensure_ascii=False)
     html_code = f"""<!DOCTYPE html>
@@ -604,11 +600,11 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
     tool = prefs["tool"]
     if not is_quota_exhausted():
         if tool == "image":
-            clean_prompt = f"Создай или отредактируй изображение: {prompt}"
+            clean_prompt = f"Generate an image: {prompt}"
         elif tool == "video":
-            clean_prompt = f"Создай видео: {prompt}"
+            clean_prompt = f"Generate a video: {prompt}"
         elif tool == "music":
-            clean_prompt = f"Создай музыку: {prompt}"
+            clean_prompt = f"Generate music/audio track: {prompt}"
 
     files = [file_path] if file_path else None
 
@@ -629,7 +625,7 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
     chat = web_chats[uid]
 
     try:
-        response = await asyncio.wait_for(chat.send_message(clean_prompt, files=files), timeout=110)
+        response = await asyncio.wait_for(chat.send_message(clean_prompt, files=files), timeout=120)
         register_chat_cid(uid, chat, response)
     except Exception as e:
         err_s = str(e).lower()
@@ -648,6 +644,7 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
     stats_store["web_ok"] += 1
     stats_store["user_reqs"][str(uid)] = stats_store["user_reqs"].get(str(uid), 0) + 1
 
+    # 1. Выгрузка сгенерированных КАРТИНОК (response.images)
     if getattr(response, "images", None) and not is_quota_exhausted():
         for idx, img in enumerate(response.images):
             out_name = f"img_{uid}_{idx}.png"
@@ -659,9 +656,53 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
                     await message.answer_photo(photo_file, reply_markup=get_main_reply_kb(uid))
                 os.remove(out_path)
 
+    # 2. Выгрузка сгенерированных ВИДЕО Veo (response.videos) с автоожиданием рендера
+    if getattr(response, "videos", None) and not is_quota_exhausted():
+        vid_dir = f"/tmp/vid_{uid}_{int(time.time())}"
+        os.makedirs(vid_dir, exist_ok=True)
+        try:
+            for vid in response.videos:
+                await vid.save(path=vid_dir, verbose=True)
+            for fname in sorted(os.listdir(vid_dir)):
+                fpath = os.path.join(vid_dir, fname)
+                if os.path.isfile(fpath):
+                    with open(fpath, "rb") as f:
+                        vid_doc = types.BufferedInputFile(f.read(), filename=fname if fname.endswith(".mp4") else f"{fname}.mp4")
+                        await message.answer_video(vid_doc, caption="🎬 <b>Видео готово!</b>", parse_mode="HTML", reply_markup=get_main_reply_kb(uid))
+        except Exception as e:
+            print(f"[!] Ошибка сохранения видео: {e}")
+        finally:
+            shutil.rmtree(vid_dir, ignore_errors=True)
+
+    # 3. Выгрузка сгенерированной МУЗЫКИ / АУДИО Lyria (response.media) с автоожиданием рендера
+    if getattr(response, "media", None) and not is_quota_exhausted():
+        med_dir = f"/tmp/med_{uid}_{int(time.time())}"
+        os.makedirs(med_dir, exist_ok=True)
+        try:
+            for med in response.media:
+                await med.save(path=med_dir, verbose=True)
+            for fname in sorted(os.listdir(med_dir)):
+                fpath = os.path.join(med_dir, fname)
+                if os.path.isfile(fpath):
+                    with open(fpath, "rb") as f:
+                        raw_b = f.read()
+                    if fname.lower().endswith((".mp3", ".wav", ".ogg", ".m4a")):
+                        aud_doc = types.BufferedInputFile(raw_b, filename=fname)
+                        await message.answer_audio(aud_doc, caption="🎵 <b>Музыкальный трек готов!</b>", parse_mode="HTML", reply_markup=get_main_reply_kb(uid))
+                    elif fname.lower().endswith(".mp4"):
+                        vid_doc = types.BufferedInputFile(raw_b, filename=fname)
+                        await message.answer_video(vid_doc, caption="🎬 <b>Видео-обложка трека</b>", parse_mode="HTML", reply_markup=get_main_reply_kb(uid))
+                    else:
+                        doc_f = types.BufferedInputFile(raw_b, filename=fname)
+                        await message.answer_document(doc_f, reply_markup=get_main_reply_kb(uid))
+        except Exception as e:
+            print(f"[!] Ошибка сохранения аудио: {e}")
+        finally:
+            shutil.rmtree(med_dir, ignore_errors=True)
+
     resp_text = getattr(response, "text", "") or ""
 
-    # Если пользователь попросил презентацию или Gemini спрятал презентацию в окно Canvas на сайте:
+    # 4. Сборка презентаций PowerPoint (.pptx + .html), если открылся Canvas
     if is_presentation_request(prompt, resp_text):
         try:
             extract_prompt = (
@@ -697,8 +738,7 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
         except Exception as e:
             print(f"[!] Ошибка сборки презентации: {e}")
 
-    # Если Gemini спрятал обычный код/текст в окно Canvas и прислал только заглушку «Вы можете посмотреть её»
-    elif is_canvas_stub(resp_text):
+    elif is_canvas_stub(resp_text) and not getattr(response, "videos", None) and not getattr(response, "media", None):
         try:
             extract_doc = await asyncio.wait_for(
                 chat.send_message("Не открывай Canvas. Выведи полное содержимое только что созданного документа/кода обычным текстом прямо сюда в сообщение."),
@@ -1211,7 +1251,7 @@ def create_dispatcher(bot_inst: Bot):
     return d
 
 @st.cache_resource
-def launch_bot_v23():
+def launch_bot_v24():
     gen_id = time.time()
     sys._active_tg_gen = gen_id
 
@@ -1248,7 +1288,7 @@ def launch_bot_v23():
     t.start()
     return t
 
-launch_bot_v23()
+launch_bot_v24()
 
 st.title("Gemini Bot")
 st.success("Активен")

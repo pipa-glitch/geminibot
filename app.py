@@ -88,7 +88,6 @@ GEMINI_KEYS = list(get_secret("GEMINI_KEYS", []))
 OWNER_USERNAME = "targetturtle"
 ACCESS_FILE = "access_db.json"
 
-# Полный реестр моделей (display_name, model_name, model_hash, tier_id)
 FULL_MODELS_CATALOG = {
     "flash-lite": ("3.5 Flash-Lite", "gemini-flash-lite", "cf41b0e0dd7d53e5", 6),
     "flash": ("3.8 Flash", "gemini-flash", "56fdd199312815e2", 11),
@@ -149,6 +148,67 @@ abuse_status_store = "Не проверено"
 last_quota_fetch_ok = False
 stats_store = {"web_ok": 0, "fallback_ok": 0, "user_reqs": {}}
 admin_input_state = {}
+pending_grant_target = {}  # Хранит цель (юз или ID), для которой админ выбирает время
+
+# Парсер произвольного времени: «1 час 30 минут», «1 час», «33 часа», «45 минут», «2 дня 4 часа»
+def parse_custom_duration(text: str) -> tuple[int, str]:
+    s = text.lower().strip()
+    if s in ("0", "навсегда", "бессрочно", "forever", "inf"):
+        return 0, "навсегда"
+
+    total_seconds = 0
+    for m in re.finditer(r"(\d+)\s*(?:дн|ден|дня|дней|сут|д\b|d\b)", s):
+        total_seconds += int(m.group(1)) * 86400
+    for m in re.finditer(r"(\d+)\s*(?:час|часа|часов|ч\b|h\b)", s):
+        total_seconds += int(m.group(1)) * 3600
+    for m in re.finditer(r"(\d+)\s*(?:мин|минута|минуты|минут|м\b|m\b)", s):
+        total_seconds += int(m.group(1)) * 60
+    for m in re.finditer(r"(\d+)\s*(?:сек|секунд|с\b|s\b)", s):
+        total_seconds += int(m.group(1))
+
+    if total_seconds == 0 and s.isdigit():
+        total_seconds = int(s) * 60
+
+    if total_seconds <= 0:
+        return -1, ""
+
+    return total_seconds, format_duration_text(total_seconds)
+
+def format_duration_text(seconds: int) -> str:
+    if seconds == 0:
+        return "♾ Навсегда"
+    if seconds < 0:
+        return "истекло"
+    total_mins = max(1, int(seconds // 60))
+    days = total_mins // 1440
+    rem_mins = total_mins % 1440
+    hours = rem_mins // 60
+    mins = rem_mins % 60
+
+    # Если меньше 3 суток — пишем в часах и минутах (например: 33 ч. или 1 ч. 30 мин.)
+    if days > 0 and total_mins < 4320 and hours + days * 24 <= 72:
+        hours += days * 24
+        days = 0
+
+    parts = []
+    if days > 0:
+        parts.append(f"{days} дн.")
+    if hours > 0:
+        parts.append(f"{hours} ч.")
+    if mins > 0:
+        parts.append(f"{mins} мин.")
+    return " ".join(parts) if parts else "1 мин."
+
+def build_duration_picker_kb(target_key: str):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📅 Сутки (24 ч.)", callback_data=f"dur_apply:{target_key}:86400")
+    kb.button(text="📆 Неделя (7 дн.)", callback_data=f"dur_apply:{target_key}:604800")
+    kb.button(text="🗓 Месяц (30 дн.)", callback_data=f"dur_apply:{target_key}:2592000")
+    kb.button(text="♾ Навсегда", callback_data=f"dur_apply:{target_key}:0")
+    kb.button(text="⏱ Своё время (ввести)", callback_data=f"dur_custom:{target_key}")
+    kb.button(text="🔙 Отмена", callback_data="adm_back")
+    kb.adjust(2, 2, 1, 1)
+    return kb.as_markup()
 
 def parse_utc_reset_to_msk(line: str, is_weekly: bool = False) -> str:
     tz_msk = timezone(timedelta(hours=3))
@@ -196,12 +256,11 @@ def _loguru_quota_sink(message):
         raw_ab = text.split("Account abuse status:", 1)[1].strip()
         abuse_status_store = "✅ Чистый (Clean)" if "Clean" in raw_ab else raw_ab
 
-if not getattr(sys, "_quota_sink_v21", False):
+if not getattr(sys, "_quota_sink_v22", False):
     logger.add(_loguru_quota_sink)
-    sys._quota_sink_v21 = True
+    sys._quota_sink_v22 = True
 
 def inject_missing_models_into_client(client):
-    """Добавляет 3.8 Flash, 3.1 Pro и 4 Argon в client._models, которые gemini_webapi пропускает из-за [None-11] и [None-4]"""
     try:
         models_dict = getattr(client, "_models", None)
         if isinstance(models_dict, dict):
@@ -296,11 +355,24 @@ def sync_user_identity(user: types.User):
             access_db["admins"].append(uid)
             changed = True
 
+    # Если пользователь уже есть в базе — обновляем его актуальный username
+    if str(uid) in access_db.get("users", {}) and uname:
+        if access_db["users"][str(uid)].get("username") != uname:
+            access_db["users"][str(uid)]["username"] = uname
+            changed = True
+
+    # Если этому @username заранее выдали доступ через админку — активируем его по ID с выбранным сроком!
     pre = access_db.get("preapproved_usernames", {})
     if uname and uname in pre:
-        exp_val = pre.pop(uname)
+        pre_data = pre.pop(uname)
+        if isinstance(pre_data, dict):
+            dur = pre_data.get("duration", 0)
+            exp_val = (time.time() + dur) if dur > 0 else 0
+        else:
+            exp_val = int(pre_data) if pre_data else 0
         access_db.setdefault("users", {})[str(uid)] = {
             "name": f"{user.full_name} (@{user.username})",
+            "username": uname,
             "expires_at": exp_val,
         }
         changed = True
@@ -928,15 +1000,100 @@ async def ask_gemini_fallback(user_id: int, new_content, history_text: str):
                 continue
     raise Exception(f"Запасные ключи не сработали: {last_err}")
 
+# Применение выдачи доступа (по ID или по @username) на заданное количество секунд
+async def apply_user_grant(bot_inst: Bot, target_key: str, seconds: int) -> str:
+    clean_key = target_key.lstrip("@").lower().strip()
+    expires_at = (time.time() + seconds) if seconds > 0 else 0
+    period_str = format_duration_text(seconds)
+
+    # Проверяем, не является ли цель числовым ID или уже существующим пользователем в базе
+    matched_uid_str = None
+    if clean_key.isdigit():
+        matched_uid_str = clean_key
+    else:
+        for u_id, info in access_db.get("users", {}).items():
+            if info.get("username", "").lower() == clean_key or f"@{clean_key}" in info.get("name", "").lower():
+                matched_uid_str = u_id
+                break
+
+    if matched_uid_str:
+        target_uid = int(matched_uid_str)
+        try:
+            chat_info = await bot_inst.get_chat(target_uid)
+            name_label = f"{chat_info.full_name} (@{chat_info.username})" if chat_info.username else chat_info.full_name
+            uname_val = (chat_info.username or "").lower()
+        except Exception:
+            old_info = access_db.get("users", {}).get(matched_uid_str, {})
+            name_label = old_info.get("name", f"ID {matched_uid_str}")
+            uname_val = old_info.get("username", clean_key)
+
+        access_db.setdefault("users", {})[matched_uid_str] = {
+            "name": name_label,
+            "username": uname_val,
+            "expires_at": expires_at,
+        }
+        access_db.get("preapproved_usernames", {}).pop(clean_key, None)
+        save_access_db(access_db)
+
+        try:
+            await bot_inst.send_message(
+                target_uid,
+                f"🎉 <b>Тебе открыт доступ к боту!</b>\n⏳ Срок: <b>{period_str}</b>\nМожешь писать вопросы или скидывать фото задач 👇",
+                parse_mode="HTML",
+                reply_markup=get_main_reply_kb(target_uid, uname_val)
+            )
+        except Exception:
+            pass
+        return f"✅ Доступ для <b>{html.escape(name_label)}</b> открыт на срок: <b>{period_str}</b>!"
+    else:
+        # Сохраняем по @username до первого входа человека в бота
+        access_db.setdefault("preapproved_usernames", {})[clean_key] = {
+            "duration": seconds,
+            "added_at": time.time(),
+        }
+        save_access_db(access_db)
+        return f"✅ Доступ для <b>@{html.escape(clean_key)}</b> сохранён на срок: <b>{period_str}</b> (активируется сразу при его входе в бота)!"
+
+# Полное удаление доступа по ID или по @username
+async def revoke_user_by_key(bot_inst: Bot, target_key: str) -> str:
+    clean_key = target_key.lstrip("@").lower().strip()
+    removed_names = []
+
+    if clean_key in access_db.get("preapproved_usernames", {}):
+        access_db["preapproved_usernames"].pop(clean_key, None)
+        removed_names.append(f"@{clean_key}")
+
+    for uid_str, info in list(access_db.get("users", {}).items()):
+        u_nick = info.get("username", "").lower()
+        u_full = info.get("name", "").lower()
+        if uid_str == clean_key or u_nick == clean_key or f"@{clean_key}" in u_full:
+            access_db["users"].pop(uid_str, None)
+            removed_names.append(info.get("name", uid_str))
+            await delete_old_web_chat(int(uid_str))
+            try:
+                await bot_inst.send_message(
+                    int(uid_str),
+                    "🔒 Твой доступ к боту завершён.",
+                    reply_markup=types.ReplyKeyboardRemove()
+                )
+            except Exception:
+                pass
+
+    save_access_db(access_db)
+    if removed_names:
+        return f"🔒 Доступ удалён у: <b>{html.escape(', '.join(removed_names))}</b>"
+    return f"⚠️ Пользователь <code>{html.escape(target_key)}</code> не найден в списке активных."
+
 def build_admin_panel_view():
     users = access_db.get("users", {})
     open_mode = access_db.get("open_mode", False)
     mode_str = "🔓 ОТКРЫТ ДЛЯ ВСЕХ" if open_mode else "🔒 ЗАКРЫТЫЙ (По заявкам)"
 
     kb = InlineKeyboardBuilder()
+    kb.button(text="➕ Выдать доступ", callback_data="adm_add_user")
+    kb.button(text="❌ Удалить доступ", callback_data="adm_del_user_menu")
     kb.button(text="📊 Лимиты и Куки", callback_data="check_limits")
     kb.button(text="🔍 Модели на аккаунте", callback_data="adm_inspect_models")
-    kb.button(text="➕ Дать доступ по @юзу", callback_data="adm_add_user")
     kb.button(text="👑 Выдать / Снять Админку", callback_data="adm_manage_admins")
     kb.button(text=f"Режим: {mode_str}", callback_data="adm_toggle_mode")
     kb.button(text="📢 Рассылка всем", callback_data="adm_broadcast")
@@ -958,21 +1115,24 @@ def build_admin_panel_view():
             continue
         active_count += 1
         reqs = stats_store["user_reqs"].get(uid_str, 0)
-        rem = "♾ Навсегда" if exp == 0 else f"⏳ {int((exp - now) // 60)} мин."
+        rem = "♾ Навсегда" if exp == 0 else f"⏳ Осталось: {format_duration_text(int(exp - now))}"
         u_name = html.escape(info.get("name", uid_str))
         is_u_adm = "👑 " if int(uid_str) in [int(x) for x in access_db.get("admins", [])] else ""
         lines.append(f"• {is_u_adm}<b>{u_name}</b> ({rem} | Запросов: {reqs})")
-        kb.button(text=f"❌ Забрать у {info.get('name', uid_str)[:18]}", callback_data=f"revoke:{uid_str}")
 
     pre = access_db.get("preapproved_usernames", {})
     if pre:
-        lines.append("\n⏳ <b>Ожидают первого входа по @юзу:</b> " + ", ".join([f"@{k}" for k in pre.keys()]))
+        pre_items = []
+        for k, v in pre.items():
+            dur_s = v.get("duration", 0) if isinstance(v, dict) else 0
+            pre_items.append(f"@{k} ({format_duration_text(dur_s)})")
+        lines.append("\n⏳ <b>Ожидают первого входа:</b> " + ", ".join(pre_items))
 
     if active_count == 0 and not pre:
         lines.append("Сейчас активных клиентов нет.")
 
     save_access_db(access_db)
-    kb.adjust(2, 2, 2, 2, 1)
+    kb.adjust(2, 2, 2, 2, 2)
     return "\n".join(lines), kb.as_markup()
 
 def create_dispatcher(bot_inst: Bot):
@@ -1016,12 +1176,14 @@ def create_dispatcher(bot_inst: Bot):
         u_nick = f"@{call.from_user.username}" if call.from_user.username else "без юзернейма"
 
         kb = InlineKeyboardBuilder()
-        kb.button(text="⏱ На 1 час (Урок)", callback_data=f"grant:{uid}:3600")
-        kb.button(text="📅 На 1 день (24ч)", callback_data=f"grant:{uid}:86400")
-        kb.button(text="♾ Навсегда", callback_data=f"grant:{uid}:0")
+        kb.button(text="📅 Сутки (24ч)", callback_data=f"dur_apply:{uid}:86400")
+        kb.button(text="📆 Неделя", callback_data=f"dur_apply:{uid}:604800")
+        kb.button(text="🗓 Месяц", callback_data=f"dur_apply:{uid}:2592000")
+        kb.button(text="♾ Навсегда", callback_data=f"dur_apply:{uid}:0")
+        kb.button(text="⏱ Своё время", callback_data=f"dur_custom:{uid}")
         kb.button(text="👑 Сделать Админом", callback_data=f"makeadm:{uid}")
         kb.button(text="❌ Отказать", callback_data=f"deny:{uid}")
-        kb.adjust(2, 1, 1, 1)
+        kb.adjust(2, 2, 1, 1, 1)
 
         for adm_id in admin_targets:
             try:
@@ -1039,45 +1201,40 @@ def create_dispatcher(bot_inst: Bot):
         await call.answer("Заявка отправлена!")
         await call.message.edit_text("⏳ <b>Заявка отправлена владельцу!</b> Ожидай подтверждения.", parse_mode="HTML")
 
-    @d.callback_query(F.data.startswith("grant:"))
-    async def cb_grant(call: types.CallbackQuery):
+    # Обработка кнопок выбора срока (Сутки, Неделя, Месяц, Навсегда)
+    @d.callback_query(F.data.startswith("dur_apply:"))
+    async def cb_dur_apply(call: types.CallbackQuery):
         if not is_admin(call.from_user.id, call.from_user.username):
             return
-        _, target_uid_str, seconds_str = call.data.split(":")
-        target_uid = int(target_uid_str)
+        _, target_key, seconds_str = call.data.split(":", 2)
         seconds = int(seconds_str)
-        expires_at = (time.time() + seconds) if seconds > 0 else 0
-
-        try:
-            chat_info = await bot_inst.get_chat(target_uid)
-            name_label = f"{chat_info.full_name} (@{chat_info.username})" if chat_info.username else chat_info.full_name
-            t_uname = chat_info.username
-        except Exception:
-            name_label = f"User {target_uid_str}"
-            t_uname = None
-
-        access_db.setdefault("users", {})[target_uid_str] = {
-            "name": name_label,
-            "expires_at": expires_at,
-        }
-        save_access_db(access_db)
-
-        period_text = "на 1 час" if seconds == 3600 else ("на 24 часа" if seconds == 86400 else "навсегда")
+        msg_res = await apply_user_grant(bot_inst, target_key, seconds)
+        kb = InlineKeyboardBuilder()
+        kb.button(text="🔙 В Админку", callback_data="adm_back")
         await call.answer("Доступ выдан!")
-        await call.message.edit_text(
-            f"✅ Доступ для <b>{html.escape(name_label)}</b> (<code>{target_uid_str}</code>) открыт <b>{period_text}</b>!",
-            parse_mode="HTML"
-        )
+        await call.message.edit_text(msg_res, parse_mode="HTML", reply_markup=kb.as_markup())
 
-        try:
-            await bot_inst.send_message(
-                target_uid,
-                f"🎉 <b>Тебе открыт доступ к боту ({period_text})!</b>\nМожешь писать вопросы или скидывать фото задач 👇",
-                parse_mode="HTML",
-                reply_markup=get_main_reply_kb(target_uid, t_uname)
-            )
-        except Exception:
-            pass
+    # Переход к вводу своего времени (в минутах/часах)
+    @d.callback_query(F.data.startswith("dur_custom:"))
+    async def cb_dur_custom(call: types.CallbackQuery):
+        if not is_admin(call.from_user.id, call.from_user.username):
+            return
+        target_key = call.data.split(":", 1)[1]
+        pending_grant_target[call.from_user.id] = target_key
+        admin_input_state[call.from_user.id] = "wait_custom_duration"
+        kb = InlineKeyboardBuilder()
+        kb.button(text="🔙 Отмена", callback_data="adm_back")
+        await call.answer()
+        await call.message.edit_text(
+            f"⏱ <b>Своё время доступа для</b> <code>{html.escape(target_key)}</code>\n\n"
+            "Напиши время следующим сообщением в любом удобном формате:\n"
+            "• <code>1 час 30 минут</code>\n"
+            "• <code>1 час</code>\n"
+            "• <code>33 часа</code>\n"
+            "• <code>45 минут</code>",
+            parse_mode="HTML",
+            reply_markup=kb.as_markup()
+        )
 
     @d.callback_query(F.data.startswith("makeadm:"))
     async def cb_makeadm(call: types.CallbackQuery):
@@ -1168,13 +1325,34 @@ def create_dispatcher(bot_inst: Bot):
     async def cb_adm_add_user(call: types.CallbackQuery):
         if not is_admin(call.from_user.id, call.from_user.username):
             return
-        admin_input_state[call.from_user.id] = "wait_add_user"
+        admin_input_state[call.from_user.id] = "wait_add_user_target"
         kb = InlineKeyboardBuilder()
         kb.button(text="🔙 Назад", callback_data="adm_back")
         await call.answer()
         await call.message.edit_text(
             "➕ <b>Выдача доступа по @юзу или ID</b>\n\n"
-            "Напиши следующим сообщением <code>@username</code> (или ID) человека, которому нужно открыть доступ:",
+            "Напиши следующим сообщением <code>@username</code> (или ID) человека, которому хочешь выдать доступ:",
+            parse_mode="HTML",
+            reply_markup=kb.as_markup()
+        )
+
+    # Меню удаления доступа (кнопками ИЛИ вводом @юза / ID)
+    @d.callback_query(F.data == "adm_del_user_menu")
+    async def cb_adm_del_user_menu(call: types.CallbackQuery):
+        if not is_admin(call.from_user.id, call.from_user.username):
+            return
+        admin_input_state[call.from_user.id] = "wait_del_user_target"
+        kb = InlineKeyboardBuilder()
+        for uid_str, info in list(access_db.get("users", {}).items()):
+            kb.button(text=f"❌ Удалить {info.get('name', uid_str)[:22]}", callback_data=f"revoke:{uid_str}")
+        for u_pre in list(access_db.get("preapproved_usernames", {}).keys()):
+            kb.button(text=f"❌ Удалить @{u_pre}", callback_data=f"revoke:{u_pre}")
+        kb.button(text="🔙 Назад", callback_data="adm_back")
+        kb.adjust(1)
+        await call.answer()
+        await call.message.edit_text(
+            "❌ <b>Удаление доступа</b>\n\n"
+            "Нажми на пользователя в списке ниже, чтобы забрать доступ, ИЛИ просто отправь его <code>@username</code> / <code>ID</code> следующим сообщением:",
             parse_mode="HTML",
             reply_markup=kb.as_markup()
         )
@@ -1336,17 +1514,11 @@ def create_dispatcher(bot_inst: Bot):
     async def cb_revoke(call: types.CallbackQuery):
         if not is_admin(call.from_user.id, call.from_user.username):
             return
-        uid_str = call.data.split(":")[1]
-        access_db.get("users", {}).pop(uid_str, None)
-        save_access_db(access_db)
-        await delete_old_web_chat(int(uid_str))
-        await call.answer("Доступ закрыт!")
+        target_key = call.data.split(":", 1)[1]
+        await revoke_user_by_key(bot_inst, target_key)
+        await call.answer("Доступ удалён!")
         text, markup = build_admin_panel_view()
         await call.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
-        try:
-            await bot_inst.send_message(int(uid_str), "🔒 Твой доступ к боту завершён.", reply_markup=types.ReplyKeyboardRemove())
-        except Exception:
-            pass
 
     @d.message(F.text == "Новый чат")
     @d.message(Command("clear"))
@@ -1460,15 +1632,39 @@ def create_dispatcher(bot_inst: Bot):
         if is_admin(uid, uname) and uid in admin_input_state:
             mode = admin_input_state.pop(uid)
             val = message.text.strip()
-            if mode == "wait_add_user":
-                clean_u = val.lstrip("@").lower()
-                if clean_u.isdigit():
-                    access_db.setdefault("users", {})[clean_u] = {"name": f"ID {clean_u}", "expires_at": 0}
-                else:
-                    access_db.setdefault("preapproved_usernames", {})[clean_u] = 0
-                save_access_db(access_db)
-                await message.answer(f"✅ Доступ для <b>@{clean_u}</b> открыт!", parse_mode="HTML", reply_markup=get_main_reply_kb(uid, uname))
+
+            if mode == "wait_add_user_target":
+                clean_target = val.lstrip("@").lower().strip()
+                await message.answer(
+                    f"⏳ Выбери срок доступа для <b>@{html.escape(clean_target)}</b>:",
+                    parse_mode="HTML",
+                    reply_markup=build_duration_picker_kb(clean_target)
+                )
                 return
+
+            elif mode == "wait_custom_duration":
+                target_key = pending_grant_target.pop(uid, None)
+                if not target_key:
+                    await message.answer("⚠️ Цель не выбрана.", reply_markup=get_main_reply_kb(uid, uname))
+                    return
+                seconds, _ = parse_custom_duration(val)
+                if seconds < 0:
+                    admin_input_state[uid] = "wait_custom_duration"
+                    pending_grant_target[uid] = target_key
+                    await message.answer(
+                        "⚠️ Не понял формат времени. Напиши, например: <code>1 час 30 минут</code>, <code>33 часа</code> или <code>45 минут</code>:",
+                        parse_mode="HTML"
+                    )
+                    return
+                res_msg = await apply_user_grant(bot_inst, target_key, seconds)
+                await message.answer(res_msg, parse_mode="HTML", reply_markup=get_main_reply_kb(uid, uname))
+                return
+
+            elif mode == "wait_del_user_target":
+                res_msg = await revoke_user_by_key(bot_inst, val)
+                await message.answer(res_msg, parse_mode="HTML", reply_markup=get_main_reply_kb(uid, uname))
+                return
+
             elif mode == "wait_add_admin":
                 clean_u = val.lstrip("@").lower()
                 if clean_u.isdigit():
@@ -1480,6 +1676,7 @@ def create_dispatcher(bot_inst: Bot):
                 save_access_db(access_db)
                 await message.answer(f"👑 Пользователь <b>@{clean_u}</b> назначен Администратором!", parse_mode="HTML", reply_markup=get_main_reply_kb(uid, uname))
                 return
+
             elif mode == "wait_broadcast":
                 sent = 0
                 for target_u in list(access_db.get("users", {}).keys()):
@@ -1490,6 +1687,7 @@ def create_dispatcher(bot_inst: Bot):
                         pass
                 await message.answer(f"✅ Рассылка отправлена ({sent} чел.)!", reply_markup=get_main_reply_kb(uid, uname))
                 return
+
             elif mode == "wait_cookie":
                 parts = val.split()
                 access_db["custom_psid"] = parts[0].strip()
@@ -1580,7 +1778,7 @@ def create_dispatcher(bot_inst: Bot):
     return d
 
 @st.cache_resource
-def launch_bot_v35():
+def launch_bot_v36():
     gen_id = time.time()
     sys._active_tg_gen = gen_id
 
@@ -1617,7 +1815,7 @@ def launch_bot_v35():
     t.start()
     return t
 
-launch_bot_v35()
+launch_bot_v36()
 
 st.title("Gemini Bot")
 st.success("Активен (@targetturtle)")

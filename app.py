@@ -20,13 +20,17 @@ import streamlit as st
 TMP_PKGS = "/tmp/pypkgs"
 os.makedirs(TMP_PKGS, exist_ok=True)
 if TMP_PKGS not in sys.path:
-    sys.path.insert(0, TMP_PKGS)
+    sys.path.append(TMP_PKGS)  # В конец sys.path, чтобы не дублировать системные пакеты!
 
 try:
     from gemini_webapi import GeminiClient, AvailableModel
+    from gemini_webapi.constants import GrpcId
+    from gemini_webapi.types import RPCData
 except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "--target", TMP_PKGS, "-U", "gemini-webapi"])
     from gemini_webapi import GeminiClient, AvailableModel
+    from gemini_webapi.constants import GrpcId
+    from gemini_webapi.types import RPCData
 
 try:
     from gemini_webapi.utils import rotate_1psidts
@@ -67,7 +71,6 @@ try:
 except Exception:
     pass
 
-from loguru import logger
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
 from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
@@ -144,13 +147,12 @@ def save_access_db(db):
         pass
 
 access_db = load_access_db()
-abuse_status_store = "Не проверено"
+abuse_status_store = "✅ Чистый (Clean)"
 last_quota_fetch_ok = False
 stats_store = {"web_ok": 0, "fallback_ok": 0, "user_reqs": {}}
 admin_input_state = {}
-pending_grant_target = {}  # Хранит цель (юз или ID), для которой админ выбирает время
+pending_grant_target = {}
 
-# Парсер произвольного времени: «1 час 30 минут», «1 час», «33 часа», «45 минут», «2 дня 4 часа»
 def parse_custom_duration(text: str) -> tuple[int, str]:
     s = text.lower().strip()
     if s in ("0", "навсегда", "бессрочно", "forever", "inf"):
@@ -185,7 +187,6 @@ def format_duration_text(seconds: int) -> str:
     hours = rem_mins // 60
     mins = rem_mins % 60
 
-    # Если меньше 3 суток — пишем в часах и минутах (например: 33 ч. или 1 ч. 30 мин.)
     if days > 0 and total_mins < 4320 and hours + days * 24 <= 72:
         hours += days * 24
         days = 0
@@ -210,55 +211,83 @@ def build_duration_picker_kb(target_key: str):
     kb.adjust(2, 2, 1, 1)
     return kb.as_markup()
 
-def parse_utc_reset_to_msk(line: str, is_weekly: bool = False) -> str:
+# Прямое чтение таблицы квот Google через RPC qp93dd (без зависимости от loguru!)
+async def fetch_real_quotas_direct(client) -> bool:
+    global last_quota_fetch_ok
     tz_msk = timezone(timedelta(hours=3))
-    m_dt = re.search(r"(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})\s*UTC", line)
-    if m_dt:
-        try:
-            dt_utc = datetime.strptime(f"{m_dt.group(1)} {m_dt.group(2)}", "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-            dt_msk = dt_utc.astimezone(tz_msk)
-            months_ru = ["", "янв.", "фев.", "мар.", "апр.", "мая", "июн.", "июл.", "авг.", "сент.", "окт.", "нояб.", "дек."]
-            if is_weekly or (dt_msk.date() != datetime.now(tz_msk).date()):
-                return f"{dt_msk.day} {months_ru[dt_msk.month]} в {dt_msk.strftime('%H:%M')}"
-            return dt_msk.strftime("%H:%M")
-        except Exception:
-            pass
-    return ""
+    months_ru = ["", "янв.", "фев.", "мар.", "апр.", "мая", "июн.", "июл.", "авг.", "сент.", "окт.", "нояб.", "дек."]
+    try:
+        response = await client._batch_execute([RPCData(rpcid=GrpcId.QUOTA, payload="[]")])
+        if not response or response.status_code != 200:
+            return False
 
-def _loguru_quota_sink(message):
-    global abuse_status_store, last_quota_fetch_ok
-    text = str(message).strip()
-    if "Account quota updated:" in text:
-        last_quota_fetch_ok = True
-        info = text.split("Account quota updated:", 1)[1].strip()
-        m_frac = re.search(r"(\d+)\s*/\s*(\d+)", info)
-        if m_frac:
-            rem = int(m_frac.group(1))
-            tot = int(m_frac.group(2))
-            if tot > 0:
-                used_pct = max(0, min(100, round((1 - (rem / tot)) * 100)))
-                if tot <= 10000:
-                    access_db["quota_short"] = {
-                        "rem": rem,
-                        "tot": tot,
-                        "pct": used_pct,
-                        "reset": parse_utc_reset_to_msk(info, is_weekly=False),
-                    }
-                else:
-                    access_db["quota_weekly"] = {
-                        "rem": rem,
-                        "tot": tot,
-                        "pct": used_pct,
-                        "reset": parse_utc_reset_to_msk(info, is_weekly=True),
-                    }
-                save_access_db(access_db)
-    elif "Account abuse status:" in text:
-        raw_ab = text.split("Account abuse status:", 1)[1].strip()
-        abuse_status_store = "✅ Чистый (Clean)" if "Clean" in raw_ab else raw_ab
+        found_any = False
+        for line in response.text.splitlines():
+            if "qp93dd" not in line:
+                continue
+            try:
+                outer = json.loads(line)
+                inner_str = next(
+                    (
+                        item[2]
+                        for item in outer
+                        if isinstance(item, list) and len(item) > 2 and item[1] == "qp93dd" and item[2]
+                    ),
+                    None,
+                )
+                if not inner_str:
+                    continue
+                data = json.loads(inner_str)
+            except Exception:
+                continue
 
-if not getattr(sys, "_quota_sink_v22", False):
-    logger.add(_loguru_quota_sink)
-    sys._quota_sink_v22 = True
+            entries = data[0] if isinstance(data, list) and data else None
+            if not isinstance(entries, list):
+                continue
+
+            for entry in entries:
+                if not isinstance(entry, list) or len(entry) < 3:
+                    continue
+                rem = entry[1]
+                tot = entry[13] if len(entry) > 13 else None
+                reset_ts = (
+                    entry[7][0]
+                    if len(entry) > 7 and isinstance(entry[7], list) and entry[7]
+                    else None
+                )
+                if isinstance(rem, int) and isinstance(tot, int) and tot > 0:
+                    found_any = True
+                    used_pct = max(0, min(100, round((1 - (rem / tot)) * 100)))
+                    reset_msk_str = ""
+                    if reset_ts:
+                        dt_msk = datetime.fromtimestamp(reset_ts, tz=tz_msk)
+                        if dt_msk.date() != datetime.now(tz_msk).date() or tot > 10000:
+                            reset_msk_str = f"{dt_msk.day} {months_ru[dt_msk.month]} в {dt_msk.strftime('%H:%M')}"
+                        else:
+                            reset_msk_str = dt_msk.strftime("%H:%M")
+
+                    if tot <= 10000:
+                        access_db["quota_short"] = {
+                            "rem": rem,
+                            "tot": tot,
+                            "pct": used_pct,
+                            "reset": reset_msk_str,
+                        }
+                    else:
+                        access_db["quota_weekly"] = {
+                            "rem": rem,
+                            "tot": tot,
+                            "pct": used_pct,
+                            "reset": reset_msk_str,
+                        }
+
+        if found_any:
+            last_quota_fetch_ok = True
+            save_access_db(access_db)
+            return True
+    except Exception as e:
+        print(f"[!] Ошибка прямого чтения квот: {e}")
+    return False
 
 def inject_missing_models_into_client(client):
     try:
@@ -282,7 +311,7 @@ def format_limits_like_web() -> str:
     qw = access_db.get("quota_weekly", {})
 
     if not qs.get("tot") and not qw.get("tot"):
-        return "⏳ <b>Данные о квоте обновляются (нажми Обновить).</b>"
+        return "⚠️ <b>Квота не получена (проверь куки).</b>"
 
     lines = ["📊 <b>Лимиты на использование</b> <code>PRO</code>\n"]
 
@@ -355,13 +384,11 @@ def sync_user_identity(user: types.User):
             access_db["admins"].append(uid)
             changed = True
 
-    # Если пользователь уже есть в базе — обновляем его актуальный username
     if str(uid) in access_db.get("users", {}) and uname:
         if access_db["users"][str(uid)].get("username") != uname:
             access_db["users"][str(uid)]["username"] = uname
             changed = True
 
-    # Если этому @username заранее выдали доступ через админку — активируем его по ID с выбранным сроком!
     pre = access_db.get("preapproved_usernames", {})
     if uname and uname in pre:
         pre_data = pre.pop(uname)
@@ -528,6 +555,7 @@ async def get_web_client(force_reinit: bool = False):
             try:
                 client = GeminiClient(psid, psidts)
                 await client.init(timeout=30, auto_refresh=True, refresh_interval=300)
+                await fetch_real_quotas_direct(client)
                 inject_missing_models_into_client(client)
                 save_refreshed_cookies(client)
                 web_client = client
@@ -538,9 +566,9 @@ async def get_web_client(force_reinit: bool = False):
                 rotated_ts = await auto_rotate_cookie_ts(psid, psidts)
                 for candidate_ts in ([rotated_ts, None] if rotated_ts else [None]):
                     try:
-                        last_quota_fetch_ok = False
                         client = GeminiClient(psid, candidate_ts)
                         await client.init(timeout=30, auto_refresh=True, refresh_interval=300)
+                        await fetch_real_quotas_direct(client)
                         inject_missing_models_into_client(client)
                         save_refreshed_cookies(client)
                         web_client = client
@@ -1000,13 +1028,11 @@ async def ask_gemini_fallback(user_id: int, new_content, history_text: str):
                 continue
     raise Exception(f"Запасные ключи не сработали: {last_err}")
 
-# Применение выдачи доступа (по ID или по @username) на заданное количество секунд
 async def apply_user_grant(bot_inst: Bot, target_key: str, seconds: int) -> str:
     clean_key = target_key.lstrip("@").lower().strip()
     expires_at = (time.time() + seconds) if seconds > 0 else 0
     period_str = format_duration_text(seconds)
 
-    # Проверяем, не является ли цель числовым ID или уже существующим пользователем в базе
     matched_uid_str = None
     if clean_key.isdigit():
         matched_uid_str = clean_key
@@ -1046,7 +1072,6 @@ async def apply_user_grant(bot_inst: Bot, target_key: str, seconds: int) -> str:
             pass
         return f"✅ Доступ для <b>{html.escape(name_label)}</b> открыт на срок: <b>{period_str}</b>!"
     else:
-        # Сохраняем по @username до первого входа человека в бота
         access_db.setdefault("preapproved_usernames", {})[clean_key] = {
             "duration": seconds,
             "added_at": time.time(),
@@ -1054,7 +1079,6 @@ async def apply_user_grant(bot_inst: Bot, target_key: str, seconds: int) -> str:
         save_access_db(access_db)
         return f"✅ Доступ для <b>@{html.escape(clean_key)}</b> сохранён на срок: <b>{period_str}</b> (активируется сразу при его входе в бота)!"
 
-# Полное удаление доступа по ID или по @username
 async def revoke_user_by_key(bot_inst: Bot, target_key: str) -> str:
     clean_key = target_key.lstrip("@").lower().strip()
     removed_names = []
@@ -1201,7 +1225,6 @@ def create_dispatcher(bot_inst: Bot):
         await call.answer("Заявка отправлена!")
         await call.message.edit_text("⏳ <b>Заявка отправлена владельцу!</b> Ожидай подтверждения.", parse_mode="HTML")
 
-    # Обработка кнопок выбора срока (Сутки, Неделя, Месяц, Навсегда)
     @d.callback_query(F.data.startswith("dur_apply:"))
     async def cb_dur_apply(call: types.CallbackQuery):
         if not is_admin(call.from_user.id, call.from_user.username):
@@ -1214,7 +1237,6 @@ def create_dispatcher(bot_inst: Bot):
         await call.answer("Доступ выдан!")
         await call.message.edit_text(msg_res, parse_mode="HTML", reply_markup=kb.as_markup())
 
-    # Переход к вводу своего времени (в минутах/часах)
     @d.callback_query(F.data.startswith("dur_custom:"))
     async def cb_dur_custom(call: types.CallbackQuery):
         if not is_admin(call.from_user.id, call.from_user.username):
@@ -1336,7 +1358,6 @@ def create_dispatcher(bot_inst: Bot):
             reply_markup=kb.as_markup()
         )
 
-    # Меню удаления доступа (кнопками ИЛИ вводом @юза / ID)
     @d.callback_query(F.data == "adm_del_user_menu")
     async def cb_adm_del_user_menu(call: types.CallbackQuery):
         if not is_admin(call.from_user.id, call.from_user.username):
@@ -1455,15 +1476,14 @@ def create_dispatcher(bot_inst: Bot):
 
     @d.callback_query(F.data == "check_limits")
     async def cb_check_limits(call: types.CallbackQuery):
-        global last_quota_fetch_ok
         if not is_admin(call.from_user.id, call.from_user.username):
             return
-        await call.answer("Обновляю данные с Google...")
+        await call.answer("Опрашиваю Google напрямую...")
         err_detail = ""
+        direct_ok = False
         try:
             client = await get_web_client()
-            if hasattr(client, "_fetch_quota"):
-                await client._fetch_quota()
+            direct_ok = await fetch_real_quotas_direct(client)
             if hasattr(client, "_fetch_abuse_status"):
                 await client._fetch_abuse_status()
             inject_missing_models_into_client(client)
@@ -1472,12 +1492,12 @@ def create_dispatcher(bot_inst: Bot):
             err_detail = str(e)
 
         has_saved_quota = bool(access_db.get("quota_short", {}).get("tot") or access_db.get("quota_weekly", {}).get("tot"))
-        if last_quota_fetch_ok or has_saved_quota:
+        if direct_ok or has_saved_quota:
             cookie_ok = "✅ Активны (Авторизован в Pro)"
         elif err_detail:
             cookie_ok = f"❌ Ошибка ({html.escape(err_detail)})"
         else:
-            cookie_ok = "⚠️ Нет ответа от квот"
+            cookie_ok = "⚠️ Нет ответа от квот (обнови куки)"
 
         web_style_limits = format_limits_like_web()
         report = (
@@ -1778,7 +1798,7 @@ def create_dispatcher(bot_inst: Bot):
     return d
 
 @st.cache_resource
-def launch_bot_v36():
+def launch_bot_v37():
     gen_id = time.time()
     sys._active_tg_gen = gen_id
 
@@ -1815,7 +1835,7 @@ def launch_bot_v36():
     t.start()
     return t
 
-launch_bot_v36()
+launch_bot_v37()
 
 st.title("Gemini Bot")
 st.success("Активен (@targetturtle)")

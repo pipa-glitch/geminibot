@@ -4,14 +4,11 @@ import io
 import re
 import html
 import json
-import copy
 import time
 import shutil
-import urllib.parse
 import subprocess
 import asyncio
 import threading
-import aiohttp
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from PIL import Image
@@ -22,18 +19,8 @@ os.makedirs(TMP_PKGS, exist_ok=True)
 if TMP_PKGS not in sys.path:
     sys.path.append(TMP_PKGS)
 
-try:
-    from gemini_webapi import GeminiClient, AvailableModel
-    import gemini_webapi.client as _gw_client
-except ImportError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "--target", TMP_PKGS, "-U", "gemini-webapi"])
-    from gemini_webapi import GeminiClient, AvailableModel
-    import gemini_webapi.client as _gw_client
-
-try:
-    from gemini_webapi.utils import rotate_1psidts
-except ImportError:
-    rotate_1psidts = None
+from gemini_webapi import GeminiClient, AvailableModel
+import gemini_webapi.client as _gw_client
 
 HAS_PPTX = False
 try:
@@ -118,8 +105,6 @@ def load_access_db():
                 data.setdefault("admin_usernames", [OWNER_USERNAME])
                 data.setdefault("preapproved_usernames", {})
                 data.setdefault("open_mode", False)
-                data.setdefault("quota_short", {})
-                data.setdefault("quota_weekly", {})
                 return data
         except Exception:
             pass
@@ -133,8 +118,6 @@ def load_access_db():
         "custom_psid": "",
         "custom_psidts": "",
         "user_cids": {},
-        "quota_short": {},
-        "quota_weekly": {},
     }
 
 def save_access_db(db):
@@ -145,13 +128,14 @@ def save_access_db(db):
         pass
 
 access_db = load_access_db()
-abuse_status_store = "✅ Чистый (Clean)"
-last_quota_fetch_ok = False
+# Живые квоты храним только в оперативной памяти (без старого кэша из файла!)
+live_quotas = {}
+abuse_status_store = "Не проверено"
 stats_store = {"web_ok": 0, "fallback_ok": 0, "user_reqs": {}}
 admin_input_state = {}
 pending_grant_target = {}
 
-def parse_utc_reset_to_msk(line: str, is_weekly: bool = False) -> str:
+def parse_utc_reset_to_msk(line: str) -> str:
     tz_msk = timezone(timedelta(hours=3))
     m_dt = re.search(r"(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})\s*UTC", line)
     if m_dt:
@@ -159,49 +143,39 @@ def parse_utc_reset_to_msk(line: str, is_weekly: bool = False) -> str:
             dt_utc = datetime.strptime(f"{m_dt.group(1)} {m_dt.group(2)}", "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
             dt_msk = dt_utc.astimezone(tz_msk)
             months_ru = ["", "янв.", "фев.", "мар.", "апр.", "мая", "июн.", "июл.", "авг.", "сент.", "окт.", "нояб.", "дек."]
-            if is_weekly or (dt_msk.date() != datetime.now(tz_msk).date()):
-                return f"{dt_msk.day} {months_ru[dt_msk.month]} в {dt_msk.strftime('%H:%M')}"
-            return dt_msk.strftime("%H:%M")
+            if dt_msk.date() != datetime.now(tz_msk).date():
+                return f"{dt_msk.day} {months_ru[dt_msk.month]} в {dt_msk.strftime('%H:%M')} (МСК)"
+            return f"в {dt_msk.strftime('%H:%M')} (МСК)"
         except Exception:
             pass
     return ""
 
 def _loguru_quota_sink(message):
-    global abuse_status_store, last_quota_fetch_ok
+    global abuse_status_store
     text = str(message).strip()
     if "Account quota updated:" in text:
-        last_quota_fetch_ok = True
         info = text.split("Account quota updated:", 1)[1].strip()
+        model_label = info.split("[")[0].strip() or "Gemini Pro"
         m_frac = re.search(r"(\d+)\s*/\s*(\d+)", info)
         if m_frac:
             rem = int(m_frac.group(1))
             tot = int(m_frac.group(2))
             if tot > 0:
                 used_pct = max(0, min(100, round((1 - (rem / tot)) * 100)))
-                if tot <= 10000:
-                    access_db["quota_short"] = {
-                        "rem": rem,
-                        "tot": tot,
-                        "pct": used_pct,
-                        "reset": parse_utc_reset_to_msk(info, is_weekly=False),
-                    }
-                else:
-                    access_db["quota_weekly"] = {
-                        "rem": rem,
-                        "tot": tot,
-                        "pct": used_pct,
-                        "reset": parse_utc_reset_to_msk(info, is_weekly=True),
-                    }
-                save_access_db(access_db)
+                live_quotas[model_label] = {
+                    "rem": rem,
+                    "tot": tot,
+                    "pct": used_pct,
+                    "reset": parse_utc_reset_to_msk(info),
+                }
     elif "Account abuse status:" in text:
         raw_ab = text.split("Account abuse status:", 1)[1].strip()
         abuse_status_store = "✅ Чистый (Clean)" if "Clean" in raw_ab else raw_ab
 
-# Подключаемся напрямую к внутреннему логгеру модуля gemini_webapi.client!
-if hasattr(_gw_client, "logger") and not getattr(_gw_client, "_sink_attached_v38", False):
+if hasattr(_gw_client, "logger") and not getattr(_gw_client, "_sink_attached_v39", False):
     try:
         _gw_client.logger.add(_loguru_quota_sink)
-        _gw_client._sink_attached_v38 = True
+        _gw_client._sink_attached_v39 = True
     except Exception:
         pass
 
@@ -263,87 +237,59 @@ def build_duration_picker_kb(target_key: str):
     kb.adjust(2, 2, 1, 1)
     return kb.as_markup()
 
-async def fetch_real_quotas_direct(client) -> bool:
-    global last_quota_fetch_ok
-    tz_msk = timezone(timedelta(hours=3))
-    months_ru = ["", "янв.", "фев.", "мар.", "апр.", "мая", "июн.", "июл.", "авг.", "сент.", "окт.", "нояб.", "дек."]
-
-    # 1. Вызываем штатный _fetch_quota (перехватывается через _gw_client.logger)
+async def refresh_live_quotas(client) -> bool:
+    live_quotas.clear()
     if hasattr(client, "_fetch_quota"):
         try:
             await client._fetch_quota()
         except Exception:
             pass
 
-    # 2. Дополнительно напрямую запрашиваем пакет qp93dd через _batch_execute
-    rpc_cls = getattr(_gw_client, "RPCData", None)
-    if rpc_cls and hasattr(client, "_batch_execute"):
-        try:
-            response = await client._batch_execute([rpc_cls(rpcid="qp93dd", payload="[]")])
-            if response and response.status_code == 200:
-                for line in response.text.splitlines():
-                    if "qp93dd" not in line:
-                        continue
-                    try:
-                        outer = json.loads(line)
-                        inner_str = next(
-                            (
-                                item[2]
-                                for item in outer
-                                if isinstance(item, list) and len(item) > 2 and item[1] == "qp93dd" and item[2]
-                            ),
-                            None,
-                        )
-                        if not inner_str:
+    if not live_quotas:
+        rpc_cls = getattr(_gw_client, "RPCData", None)
+        if rpc_cls and hasattr(client, "_batch_execute"):
+            tz_msk = timezone(timedelta(hours=3))
+            months_ru = ["", "янв.", "фев.", "мар.", "апр.", "мая", "июн.", "июл.", "авг.", "сент.", "окт.", "нояб.", "дек."]
+            try:
+                response = await client._batch_execute([rpc_cls(rpcid="qp93dd", payload="[]")])
+                if response and response.status_code == 200:
+                    for line in response.text.splitlines():
+                        if "qp93dd" not in line:
                             continue
-                        data = json.loads(inner_str)
-                    except Exception:
-                        continue
-
-                    entries = data[0] if isinstance(data, list) and data else None
-                    if not isinstance(entries, list):
-                        continue
-
-                    for entry in entries:
-                        if not isinstance(entry, list) or len(entry) < 3:
+                        try:
+                            outer = json.loads(line)
+                            inner_str = next(
+                                (item[2] for item in outer if isinstance(item, list) and len(item) > 2 and item[1] == "qp93dd" and item[2]),
+                                None,
+                            )
+                            if not inner_str:
+                                continue
+                            data = json.loads(inner_str)
+                        except Exception:
                             continue
-                        rem = entry[1]
-                        tot = entry[13] if len(entry) > 13 else None
-                        reset_ts = (
-                            entry[7][0]
-                            if len(entry) > 7 and isinstance(entry[7], list) and entry[7]
-                            else None
-                        )
-                        if isinstance(rem, int) and isinstance(tot, int) and tot > 0:
-                            last_quota_fetch_ok = True
-                            used_pct = max(0, min(100, round((1 - (rem / tot)) * 100)))
-                            reset_msk_str = ""
-                            if reset_ts:
-                                dt_msk = datetime.fromtimestamp(reset_ts, tz=tz_msk)
-                                if dt_msk.date() != datetime.now(tz_msk).date() or tot > 10000:
-                                    reset_msk_str = f"{dt_msk.day} {months_ru[dt_msk.month]} в {dt_msk.strftime('%H:%M')}"
-                                else:
-                                    reset_msk_str = dt_msk.strftime("%H:%M")
-
-                            if tot <= 10000:
-                                access_db["quota_short"] = {
-                                    "rem": rem,
-                                    "tot": tot,
-                                    "pct": used_pct,
-                                    "reset": reset_msk_str,
-                                }
-                            else:
-                                access_db["quota_weekly"] = {
-                                    "rem": rem,
-                                    "tot": tot,
-                                    "pct": used_pct,
-                                    "reset": reset_msk_str,
-                                }
-                save_access_db(access_db)
-        except Exception as e:
-            print(f"[!] Ошибка прямого чтения qp93dd: {e}")
-
-    return last_quota_fetch_ok
+                        entries = data[0] if isinstance(data, list) and data else None
+                        if not isinstance(entries, list):
+                            continue
+                        for entry in entries:
+                            if not isinstance(entry, list) or len(entry) < 3:
+                                continue
+                            rem = entry[1]
+                            tot = entry[13] if len(entry) > 13 else None
+                            d_name = entry[12] if len(entry) > 12 else "Gemini Pro"
+                            reset_ts = entry[7][0] if len(entry) > 7 and isinstance(entry[7], list) and entry[7] else None
+                            if isinstance(rem, int) and isinstance(tot, int) and tot > 0:
+                                used_pct = max(0, min(100, round((1 - (rem / tot)) * 100)))
+                                reset_str = ""
+                                if reset_ts:
+                                    dt_msk = datetime.fromtimestamp(reset_ts, tz=tz_msk)
+                                    if dt_msk.date() != datetime.now(tz_msk).date():
+                                        reset_str = f"{dt_msk.day} {months_ru[dt_msk.month]} в {dt_msk.strftime('%H:%M')} (МСК)"
+                                    else:
+                                        reset_str = f"в {dt_msk.strftime('%H:%M')} (МСК)"
+                                live_quotas[str(d_name)] = {"rem": rem, "tot": tot, "pct": used_pct, "reset": reset_str}
+            except Exception:
+                pass
+    return len(live_quotas) > 0
 
 def inject_missing_models_into_client(client):
     try:
@@ -352,8 +298,8 @@ def inject_missing_models_into_client(client):
             for key in FULL_MODELS_CATALOG:
                 m_obj = make_available_model(key, "low")
                 models_dict[m_obj.model_name] = m_obj
-    except Exception as e:
-        print(f"[!] Ошибка инжекта моделей: {e}")
+    except Exception:
+        pass
 
 def make_progress_bar(pct: int, length: int = 18) -> str:
     filled = round((pct / 100) * length)
@@ -363,32 +309,18 @@ def make_progress_bar(pct: int, length: int = 18) -> str:
     return "█" * filled + "░" * (length - filled)
 
 def format_limits_like_web() -> str:
-    qs = access_db.get("quota_short", {})
-    qw = access_db.get("quota_weekly", {})
+    if not live_quotas:
+        return "❌ <b>Google не вернул квоты подписки Pro (куки не прошли авторизацию).</b>"
 
-    if not qs.get("tot") and not qw.get("tot"):
-        return "⚠️ <b>Квота не получена (проверь куки).</b>"
-
-    lines = ["📊 <b>Лимиты на использование</b> <code>PRO</code>\n"]
-
-    if qs.get("tot"):
-        cur_pct = qs.get("pct", 0)
-        bar_cur = make_progress_bar(cur_pct)
-        reset_s = f"\n<i>Лимит сбросится в {qs['reset']} (МСК)</i>" if qs.get("reset") else ""
+    lines = ["📊 <b>Лимиты на использование</b> <code>PRO</code>\n<i>Реальные данные с сервера Google</i>\n"]
+    for m_label, q in live_quotas.items():
+        pct = q["pct"]
+        bar = make_progress_bar(pct)
+        r_note = f"\n<i>Лимит сбросится {q['reset']}</i>" if q.get("reset") else ""
         lines.append(
-            f"<b>Текущее использование</b> — <b>Использовано {cur_pct} %</b> ({qs['rem']}/{qs['tot']})\n"
-            f"<code>{bar_cur}</code>{reset_s}\n"
+            f"<b>{html.escape(m_label)}</b> — <b>Использовано {pct} %</b> ({q['rem']}/{q['tot']})\n"
+            f"<code>{bar}</code>{r_note}\n"
         )
-
-    if qw.get("tot"):
-        week_pct = qw.get("pct", 0)
-        bar_week = make_progress_bar(week_pct)
-        reset_w = f"\n<i>Лимит сбросится {qw['reset']} (МСК)</i>" if qw.get("reset") else ""
-        lines.append(
-            f"<b>Недельный лимит</b> — <b>Использовано {week_pct} %</b> ({qw['rem']}/{qw['tot']})\n"
-            f"<code>{bar_week}</code>{reset_w}"
-        )
-
     return "\n".join(lines)
 
 def markdown_to_telegram_html(text: str) -> str:
@@ -568,70 +500,20 @@ def get_active_cookies():
     psidts = access_db.get("custom_psidts") or SECURE_1PSIDTS
     return psid.strip() if psid else "", psidts.strip() if psidts else None
 
-def save_refreshed_cookies(client):
-    try:
-        cookies_dict = getattr(client, "cookies", None) or {}
-        new_ts = cookies_dict.get("__Secure-1PSIDTS")
-        new_psid = cookies_dict.get("__Secure-1PSID")
-        changed = False
-        if new_ts and new_ts != access_db.get("custom_psidts"):
-            access_db["custom_psidts"] = new_ts
-            changed = True
-        if new_psid and new_psid != access_db.get("custom_psid"):
-            access_db["custom_psid"] = new_psid
-            changed = True
-        if changed:
-            save_access_db(access_db)
-    except Exception:
-        pass
-
-async def auto_rotate_cookie_ts(psid: str, old_psidts: str = None):
-    if not rotate_1psidts or not psid:
-        return None
-    for payload in ([{"__Secure-1PSID": psid, "__Secure-1PSIDTS": old_psidts}, {"__Secure-1PSID": psid}] if old_psidts else [{"__Secure-1PSID": psid}]):
-        try:
-            res = rotate_1psidts(payload)
-            new_ts = (await res) if asyncio.iscoroutine(res) else res
-            if new_ts and isinstance(new_ts, str):
-                access_db["custom_psidts"] = new_ts
-                save_access_db(access_db)
-                return new_ts
-        except Exception:
-            continue
-    return None
-
+# Строгое подключение с обоими куками (БЕЗ сброса psidts в None!)
 async def get_web_client(force_reinit: bool = False):
-    global web_client, last_quota_fetch_ok
+    global web_client
     psid, psidts = get_active_cookies()
     if not psid:
         raise Exception("В Secrets не указан SECURE_1PSID")
     async with web_init_lock:
         if force_reinit or web_client is None:
-            last_quota_fetch_ok = False
-            try:
-                client = GeminiClient(psid, psidts)
-                await client.init(timeout=30, auto_refresh=True, refresh_interval=300)
-                await fetch_real_quotas_direct(client)
-                inject_missing_models_into_client(client)
-                save_refreshed_cookies(client)
-                web_client = client
-            except Exception:
-                web_client = None
-
-            if not last_quota_fetch_ok or web_client is None:
-                rotated_ts = await auto_rotate_cookie_ts(psid, psidts)
-                for candidate_ts in ([rotated_ts, None] if rotated_ts else [None]):
-                    try:
-                        client = GeminiClient(psid, candidate_ts)
-                        await client.init(timeout=30, auto_refresh=True, refresh_interval=300)
-                        await fetch_real_quotas_direct(client)
-                        inject_missing_models_into_client(client)
-                        save_refreshed_cookies(client)
-                        web_client = client
-                        if last_quota_fetch_ok:
-                            break
-                    except Exception:
-                        continue
+            live_quotas.clear()
+            client = GeminiClient(psid, psidts)
+            await client.init(timeout=30, auto_refresh=True, refresh_interval=300)
+            await refresh_live_quotas(client)
+            inject_missing_models_into_client(client)
+            web_client = client
     if web_client is not None:
         inject_missing_models_into_client(web_client)
     return web_client
@@ -854,62 +736,14 @@ def is_canvas_stub(resp_text: str) -> bool:
     stubs = ["i will now generate", "вы можете посмотреть её", "вы можете посмотреть его", "готова! вы можете", "готов! вы можете"]
     return len(resp_text) < 600 and any(s in r_low for s in stubs)
 
-def is_image_request(prompt: str, tool: str) -> bool:
-    if tool == "image":
-        return True
-    p_low = prompt.lower()
-    return any(w in p_low for w in ["сгенерируй изображен", "сгенерируй картинк", "нарисуй", "создай картинк", "создай изображен", "кинь картинк"])
-
-async def send_fallback_image(message: types.Message, prompt_ru: str):
-    uid = message.from_user.id
-    uname = message.from_user.username
-    prompt_en = prompt_ru
-    for key in GEMINI_KEYS:
-        if not key:
-            continue
-        try:
-            g_client = genai.Client(api_key=key.strip())
-            tr = await asyncio.to_thread(
-                g_client.models.generate_content,
-                model="gemini-3.5-flash-lite",
-                contents=f"Translate this image generation prompt into detailed English (output ONLY the English prompt, nothing else): {prompt_ru}",
-            )
-            if tr and tr.text:
-                prompt_en = tr.text.strip()
-            break
-        except Exception:
-            continue
-
-    encoded = urllib.parse.quote(prompt_en[:400])
-    img_url = f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=1024&nologo=true&model=flux"
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0.0.0 Safari/537.36"}
-    try:
-        async with aiohttp.ClientSession(headers=headers) as session:
-            async with session.get(img_url, timeout=40) as resp:
-                if resp.status == 200:
-                    data = await resp.read()
-                    photo_file = types.BufferedInputFile(data, filename="generated.jpg")
-                    await message.answer_photo(photo_file, reply_markup=get_main_reply_kb(uid, uname))
-                    return True
-    except Exception:
-        pass
-    try:
-        await message.answer_photo(img_url, reply_markup=get_main_reply_kb(uid, uname))
-        return True
-    except Exception:
-        return False
-
 async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, file_path: str = None):
     uid = message.from_user.id
     uname = message.from_user.username
     prefs = get_prefs(uid)
-    want_img = is_image_request(prompt, prefs["tool"])
-
-    effective_model_code = "flash" if (want_img and prefs["model"] == "flash-lite") else prefs["model"]
 
     files = [file_path] if file_path else None
     client = await get_web_client()
-    target_model = resolve_model_clean(client, effective_model_code, prefs["reasoning"])
+    target_model = resolve_model_clean(client, prefs["model"], prefs["reasoning"])
 
     if uid not in web_chats:
         web_chats[uid] = client.start_chat(model=target_model)
@@ -918,8 +752,6 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
 
     chat = web_chats[uid]
     response = await asyncio.wait_for(chat.send_message(prompt, files=files), timeout=90)
-
-    save_refreshed_cookies(client)
     register_chat_cid(uid, chat, response)
 
     resp_text = getattr(response, "text", "") or ""
@@ -927,7 +759,7 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
     stats_store["web_ok"] += 1
     stats_store["user_reqs"][str(uid)] = stats_store["user_reqs"].get(str(uid), 0) + 1
 
-    sent_any_image = False
+    # Отправка ТОЛЬКО настоящих картинок из ответа Gemini Web (без сторонних генераторов!)
     if getattr(response, "images", None):
         for idx, img in enumerate(response.images):
             try:
@@ -939,21 +771,14 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
                         photo_file = types.BufferedInputFile(f.read(), filename=out_name)
                         await message.answer_photo(photo_file, reply_markup=get_main_reply_kb(uid, uname))
                     os.remove(out_path)
-                    sent_any_image = True
                 elif getattr(img, "url", None):
                     await message.answer_photo(img.url, reply_markup=get_main_reply_kb(uid, uname))
-                    sent_any_image = True
             except Exception:
                 if getattr(img, "url", None):
                     try:
                         await message.answer_photo(img.url, reply_markup=get_main_reply_kb(uid, uname))
-                        sent_any_image = True
                     except Exception:
                         pass
-
-    if want_img and not sent_any_image and not getattr(response, "videos", None):
-        if await send_fallback_image(message, prompt):
-            return
 
     if getattr(response, "videos", None):
         vid_dir = f"/tmp/vid_{uid}_{int(time.time())}"
@@ -1539,21 +1364,19 @@ def create_dispatcher(bot_inst: Bot):
         direct_ok = False
         try:
             client = await get_web_client()
-            direct_ok = await fetch_real_quotas_direct(client)
+            direct_ok = await refresh_live_quotas(client)
             if hasattr(client, "_fetch_abuse_status"):
                 await client._fetch_abuse_status()
             inject_missing_models_into_client(client)
-            save_refreshed_cookies(client)
         except Exception as e:
             err_detail = str(e)
 
-        has_saved_quota = bool(access_db.get("quota_short", {}).get("tot") or access_db.get("quota_weekly", {}).get("tot"))
-        if direct_ok or has_saved_quota:
+        if direct_ok:
             cookie_ok = "✅ Активны (Авторизован в Pro)"
         elif err_detail:
             cookie_ok = f"❌ Ошибка ({html.escape(err_detail)})"
         else:
-            cookie_ok = "⚠️ Нет ответа от квот (обнови куки)"
+            cookie_ok = "❌ Разлогинены (квота Pro не получена)"
 
         web_style_limits = format_limits_like_web()
         report = (
@@ -1582,7 +1405,11 @@ def create_dispatcher(bot_inst: Bot):
         kb.button(text="🔙 Назад в Админку", callback_data="adm_back")
         try:
             await get_web_client(force_reinit=True)
-            await call.message.edit_text("✅ <b>Веб-сессия Gemini Pro переподключена, все модели активны!</b>", parse_mode="HTML", reply_markup=kb.as_markup())
+            if live_quotas:
+                msg_st = "✅ <b>Веб-сессия Gemini Pro переподключена, квота Pro подтверждена!</b>"
+            else:
+                msg_st = "⚠️ <b>Сессия запущена, но Google не вернул квоты Pro (проверь куки в «🍪 Обновить Куки»).</b>"
+            await call.message.edit_text(msg_st, parse_mode="HTML", reply_markup=kb.as_markup())
         except Exception as e:
             await call.message.edit_text(f"⚠️ Не удалось переподключить Веб: <code>{html.escape(str(e))}</code>", parse_mode="HTML", reply_markup=kb.as_markup())
 
@@ -1771,127 +1598,7 @@ def create_dispatcher(bot_inst: Bot):
                 save_access_db(access_db)
                 try:
                     await get_web_client(force_reinit=True)
-                    await message.answer("✅ <b>Новые куки сохранены и подключены!</b>", parse_mode="HTML", reply_markup=get_main_reply_kb(uid, uname))
-                except Exception as e:
-                    await message.answer(f"⚠️ Ошибка при проверке куков: <code>{html.escape(str(e))}</code>", parse_mode="HTML")
-                return
-
-        async with continuous_typing(bot_inst, message.chat.id, "typing"):
-            try:
-                await ask_gemini_web(bot_inst, message, message.text)
-            except Exception as web_err:
-                prefs = get_prefs(uid)
-                if is_image_request(message.text, prefs["tool"]):
-                    if await send_fallback_image(message, message.text):
-                        return
-                try:
-                    err_name = f"{type(web_err).__name__}: {web_err}".strip(": ")
-                    ans, used_model = await ask_gemini_fallback(uid, message.text, message.text)
-                    warn = f"⚠️ [Запасной API ({used_model}) | Веб: {err_name}]\n\n"
-                    await safe_send(message, warn + ans)
-                except Exception as e:
-                    await message.answer(f"Ошибка: {e}", reply_markup=get_main_reply_kb(uid, uname))
-
-    @d.message(F.photo)
-    async def handle_photo(message: types.Message):
-        uid = message.from_user.id
-        uname = message.from_user.username
-        if not check_access(message.from_user):
-            await message.answer("🔒 Доступ закрыт. Отправь заявку владельцу:", reply_markup=get_locked_kb())
-            return
-
-        temp_path = f"/tmp/photo_{uid}.jpg"
-        async with continuous_typing(bot_inst, message.chat.id, "typing"):
-            try:
-                photo = message.photo[-1]
-                file_io = io.BytesIO()
-                await bot_inst.download(photo, destination=file_io)
-                file_io.seek(0)
-                with open(temp_path, "wb") as f:
-                    f.write(file_io.getvalue())
-
-                caption = message.caption or "Реши или опиши фото."
-                try:
-                    await ask_gemini_web(bot_inst, message, caption, file_path=temp_path)
-                except Exception as web_err:
-                    err_name = f"{type(web_err).__name__}: {web_err}".strip(": ")
-                    image = Image.open(file_io)
-                    image.load()
-                    ans, used_model = await ask_gemini_fallback(uid, [caption, image], f"[Фото] {caption}")
-                    warn = f"⚠️ [Запасной API ({used_model}) | Веб: {err_name}]\n\n"
-                    await safe_send(message, warn + ans)
-            except Exception as e:
-                await message.answer(f"Ошибка: {e}", reply_markup=get_main_reply_kb(uid, uname))
-            finally:
-                if os.path.exists(temp_path):
-                    os.remove(temp_path)
-
-    @d.message(F.document)
-    async def handle_document(message: types.Message):
-        uid = message.from_user.id
-        uname = message.from_user.username
-        if not check_access(message.from_user):
-            await message.answer("🔒 Доступ закрыт. Отправь заявку владельцу:", reply_markup=get_locked_kb())
-            return
-
-        doc = message.document
-        temp_path = os.path.join("/tmp", doc.file_name or f"file_{uid}")
-        async with continuous_typing(bot_inst, message.chat.id, "typing"):
-            try:
-                file_io = io.BytesIO()
-                await bot_inst.download(doc, destination=file_io)
-                with open(temp_path, "wb") as f:
-                    f.write(file_io.getvalue())
-
-                caption = message.caption or "Проанализируй файл."
-                await ask_gemini_web(bot_inst, message, caption, file_path=temp_path)
-            except Exception as e:
-                await message.answer(f"Ошибка файла: {e}", reply_markup=get_main_reply_kb(uid, uname))
-            finally:
-                if os.path.exists(temp_path):
-                    os.remove(temp_path)
-
-    return d
-
-@st.cache_resource
-def launch_bot_v38():
-    gen_id = time.time()
-    sys._active_tg_gen = gen_id
-
-    old_state = getattr(sys, "_active_tg_bot", None)
-    if old_state:
-        try:
-            old_loop = old_state[0]
-            old_dp = old_state[1]
-            asyncio.run_coroutine_threadsafe(old_dp.stop_polling(), old_loop)
-            if len(old_state) > 2 and old_state[2] is not None:
-                asyncio.run_coroutine_threadsafe(old_state[2].session.close(), old_loop)
-        except Exception:
-            pass
-        time.sleep(1.5)
-
-    def worker():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        bot_inst = Bot(token=TELEGRAM_TOKEN)
-        dp_inst = create_dispatcher(bot_inst)
-        sys._active_tg_bot = (loop, dp_inst, bot_inst)
-
-        async def runner():
-            while getattr(sys, "_active_tg_gen", None) == gen_id:
-                try:
-                    await bot_inst.delete_webhook(drop_pending_updates=True)
-                    await dp_inst.start_polling(bot_inst, handle_signals=False)
-                except Exception:
-                    await asyncio.sleep(3)
-
-        loop.run_until_complete(runner())
-
-    t = threading.Thread(target=worker, daemon=True)
-    t.start()
-    return t
-
-launch_bot_v38()
-
-st.title("Gemini Bot")
-st.success("Активен (@targetturtle)")
+                    if live_quotas:
+                        await message.answer("✅ <b>Новые куки сохранены, квота Pro подтверждена!</b>", parse_mode="HTML", reply_markup=get_main_reply_kb(uid, uname))
+                    else:
+                        await message.answer("⚠️ <b>Куки записаны, но Google не отдал квоту Pro (проверь правильность 1PSID и 1PSIDTS).</b>", parse_

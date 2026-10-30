@@ -14,9 +14,6 @@ import streamlit as st
 
 try:
     from gemini_webapi import GeminiClient
-    if not hasattr(GeminiClient, "delete_chat"):
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "-U", "gemini-webapi"])
-        from gemini_webapi import GeminiClient
 except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "-U", "gemini-webapi"])
     from gemini_webapi import GeminiClient
@@ -60,11 +57,10 @@ def _loguru_quota_sink(message):
         raw_ab = text.split("Account abuse status:", 1)[1].strip()
         abuse_status_store = "✅ Чистый (Без ограничений)" if "Clean" in raw_ab else raw_ab
 
-if not getattr(sys, "_quota_sink_v4", False):
+if not getattr(sys, "_quota_sink_v5", False):
     logger.add(_loguru_quota_sink)
-    sys._quota_sink_v4 = True
+    sys._quota_sink_v5 = True
 
-# Непрерывный статус «печатает...» до самого момента отправки ответа
 @asynccontextmanager
 async def continuous_typing(bot_inst: Bot, chat_id: int, action: str = "typing"):
     stop_event = asyncio.Event()
@@ -179,7 +175,6 @@ def save_access_db(db):
 access_db = load_access_db()
 
 def register_chat_cid(uid: int, *objs):
-    """Сохраняет ID чата (cid) на диск, чтобы гарантированно удалить его при создании нового"""
     cids = access_db.setdefault("user_cids", {}).setdefault(str(uid), [])
     changed = False
     for obj in objs:
@@ -287,7 +282,6 @@ async def get_web_client(force_reinit: bool = False):
             web_client = client
     return web_client
 
-# Гарантированное удаление всех старых чатов пользователя с серверов gemini.google.com
 async def delete_old_web_chat(uid: int):
     old_chat = web_chats.pop(uid, None)
     if old_chat is not None:
@@ -383,44 +377,37 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
 
     files = [file_path] if file_path else None
 
-    last_web_err = None
-    response = None
-    for attempt in range(2):
-        try:
-            client = await get_web_client(force_reinit=(attempt == 1))
-            if hasattr(client, "_fetch_quota"):
-                try:
-                    await client._fetch_quota()
-                except Exception:
-                    pass
+    client = await get_web_client()
+    prefs = enforce_quota_restrictions(uid)
+    target_model = resolve_clean_model(client, prefs["model"])
 
+    if uid not in web_chats:
+        web_chats[uid] = client.start_chat(model=target_model) if target_model else client.start_chat()
+    else:
+        old_chat = web_chats[uid]
+        if target_model:
+            try:
+                web_chats[uid] = client.start_chat(model=target_model, metadata=old_chat.metadata)
+            except Exception:
+                old_chat.model = target_model
+
+    chat = web_chats[uid]
+
+    try:
+        # Не ставим короткий таймаут 45с, чтобы внутренний [Recovery] на 48-й секунде спокойно забирал готовый ответ!
+        response = await asyncio.wait_for(chat.send_message(clean_prompt, files=files), timeout=110)
+        register_chat_cid(uid, chat, response)
+    except Exception as e:
+        err_s = str(e).lower()
+        if ("quota" in err_s or "limit" in err_s or "429" in err_s) and prefs["model"] != "flash-lite":
+            force_quota_lock = True
             prefs = enforce_quota_restrictions(uid)
-            target_model = resolve_clean_model(client, prefs["model"])
-
-            # Если создается новый чат — сначала удаляем предыдущий чат пользователя с сайта
-            if attempt == 1 or uid not in web_chats:
-                await delete_old_web_chat(uid)
-                web_chats[uid] = client.start_chat(model=target_model) if target_model else client.start_chat()
-
-            chat = web_chats[uid]
-            response = await asyncio.wait_for(chat.send_message(clean_prompt, files=files), timeout=45)
-            # Сразу фиксируем cid созданного диалога на диск
-            register_chat_cid(uid, chat, response)
-            break
-        except Exception as e:
-            err_s = str(e).lower()
-            if ("quota" in err_s or "limit" in err_s or "429" in err_s) and prefs["model"] != "flash-lite":
-                force_quota_lock = True
-                prefs = enforce_quota_restrictions(uid)
-                clean_prompt = prompt
-                await delete_old_web_chat(uid)
-                continue
-            last_web_err = e
-            await delete_old_web_chat(uid)
-            continue
-
-    if response is None:
-        raise Exception(last_web_err)
+            lite_model = resolve_clean_model(client, "flash-lite")
+            web_chats[uid] = client.start_chat(model=lite_model) if lite_model else client.start_chat()
+            response = await asyncio.wait_for(web_chats[uid].send_message(prompt, files=files), timeout=110)
+            register_chat_cid(uid, web_chats[uid], response)
+        else:
+            raise e
 
     stats_store["web_ok"] += 1
     stats_store["user_reqs"][str(uid)] = stats_store["user_reqs"].get(str(uid), 0) + 1
@@ -660,11 +647,9 @@ def create_dispatcher(bot_inst: Bot):
         deleted_count = 0
         try:
             client = await get_web_client()
-            # 1. Удаляем все сохраненные в базе cid
             for uid_str in list(access_db.get("user_cids", {}).keys()):
                 await delete_old_web_chat(int(uid_str))
                 deleted_count += 1
-            # 2. Если поддерживается list_chats — вычищаем вообще всю боковую панель на сайте
             if hasattr(client, "list_chats") and hasattr(client, "delete_chat"):
                 chats = await client.list_chats()
                 if chats:
@@ -788,7 +773,6 @@ def create_dispatcher(bot_inst: Bot):
         if prefs["model"] != code:
             prefs["model"] = code
             prefs["model_label"] = label
-            # При смене модели сразу удаляем старый чат с сайта, чтобы не было конфликта моделей
             await delete_old_web_chat(uid)
         await call.answer()
         await call.message.edit_text(f"Модель: *{label}*", parse_mode="Markdown")
@@ -926,7 +910,7 @@ def create_dispatcher(bot_inst: Bot):
     return d
 
 @st.cache_resource
-def launch_bot_v18():
+def launch_bot_v19():
     gen_id = time.time()
     sys._active_tg_gen = gen_id
 
@@ -963,7 +947,7 @@ def launch_bot_v18():
     t.start()
     return t
 
-launch_bot_v18()
+launch_bot_v19()
 
 st.title("Gemini Bot")
 st.success("Активен")

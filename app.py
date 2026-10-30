@@ -23,33 +23,15 @@ if TMP_PKGS not in sys.path:
     sys.path.insert(0, TMP_PKGS)
 
 try:
-    from gemini_webapi import GeminiClient
-    from gemini_webapi.constants import AvailableModel
+    from gemini_webapi import GeminiClient, AvailableModel
 except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "--target", TMP_PKGS, "-U", "gemini-webapi"])
-    from gemini_webapi import GeminiClient
-    from gemini_webapi.constants import AvailableModel
+    from gemini_webapi import GeminiClient, AvailableModel
 
 try:
     from gemini_webapi.utils import rotate_1psidts
 except ImportError:
     rotate_1psidts = None
-
-# Патч свойства AvailableModel.model_header, чтобы библиотека не сбрасывала заголовки моделей и уровень рассуждений!
-def _patched_model_header(self) -> dict[str, str]:
-    if not getattr(self, "model_hash", None) or getattr(self, "tier_id", None) is None:
-        return {}
-    r_slot = getattr(self, "_reasoning_slot", 1)
-    return {
-        "x-goog-ext-525001261-jspb": (
-            f'[1,null,null,null,"{self.model_hash}",null,null,0,'
-            f'[4,5,6,8],null,null,{r_slot},null,null,{self.tier_id}]'
-        ),
-        "x-goog-ext-73010989-jspb": "[0]",
-        "x-goog-ext-73010990-jspb": "[0,0,0]",
-    }
-
-AvailableModel.model_header = property(_patched_model_header)
 
 HAS_PPTX = False
 try:
@@ -113,6 +95,19 @@ FULL_MODELS_CATALOG = {
     "pro": ("3.1 Pro", "gemini-pro", "e6fa609c3fa255c0", 4),
     "argon": ("4 Argon", "gemini-argon", "e6fa609c3fa255c0", 4),
 }
+
+def make_available_model(code: str, reasoning_code: str = "low") -> AvailableModel:
+    d_name, m_name, m_hash, t_id = FULL_MODELS_CATALOG.get(code.lower(), FULL_MODELS_CATALOG["flash"])
+    r_slot = 1 if reasoning_code == "low" else 2
+    hdr = {
+        "x-goog-ext-525001261-jspb": (
+            f'[1,null,null,null,"{m_hash}",null,null,0,'
+            f'[4,5,6,8],null,null,{r_slot}, null,null,{t_id}]'
+        ),
+        "x-goog-ext-73010989-jspb": "[0]",
+        "x-goog-ext-73010990-jspb": "[0,0,0]",
+    }
+    return AvailableModel(model_name=m_name, display_name=d_name, model_header=hdr)
 
 def load_access_db():
     if os.path.exists(ACCESS_FILE):
@@ -201,31 +196,18 @@ def _loguru_quota_sink(message):
         raw_ab = text.split("Account abuse status:", 1)[1].strip()
         abuse_status_store = "✅ Чистый (Clean)" if "Clean" in raw_ab else raw_ab
 
-if not getattr(sys, "_quota_sink_v20", False):
+if not getattr(sys, "_quota_sink_v21", False):
     logger.add(_loguru_quota_sink)
-    sys._quota_sink_v20 = True
+    sys._quota_sink_v21 = True
 
 def inject_missing_models_into_client(client):
-    """Восстанавливает 3.8 Flash, 3.1 Pro и 4 Argon в client._models, которые gemini_webapi выкидывает из-за [None-11] и [None-4]"""
+    """Добавляет 3.8 Flash, 3.1 Pro и 4 Argon в client._models, которые gemini_webapi пропускает из-за [None-11] и [None-4]"""
     try:
         models_dict = getattr(client, "_models", None)
         if isinstance(models_dict, dict):
-            for key, (d_name, m_name, m_hash, t_id) in FULL_MODELS_CATALOG.items():
-                if m_name not in models_dict:
-                    m_obj = AvailableModel(
-                        display_name=d_name,
-                        model_name=m_name,
-                        model_hash=m_hash,
-                        tier_id=t_id,
-                    )
-                    m_obj._reasoning_slot = 1
-                    models_dict[m_name] = m_obj
-                else:
-                    existing = models_dict[m_name]
-                    if not getattr(existing, "model_hash", None):
-                        existing.model_hash = m_hash
-                    if getattr(existing, "tier_id", None) is None:
-                        existing.tier_id = t_id
+            for key in FULL_MODELS_CATALOG:
+                m_obj = make_available_model(key, "low")
+                models_dict[m_obj.model_name] = m_obj
     except Exception as e:
         print(f"[!] Ошибка инжекта моделей: {e}")
 
@@ -520,21 +502,9 @@ async def delete_old_web_chat(uid: int):
     except Exception:
         pass
 
-def resolve_model_clean(client, model_code: str, reasoning_code: str = "low"):
-    """Создаёт реальный экземпляр AvailableModel с нужным model_hash, tier_id и _reasoning_slot (индекс 11)"""
+def resolve_model_clean(client, model_code: str, reasoning_code: str = "low") -> AvailableModel:
     inject_missing_models_into_client(client)
-    code = model_code.lower()
-    d_name, m_name, m_hash, t_id = FULL_MODELS_CATALOG.get(code, FULL_MODELS_CATALOG["flash"])
-    r_slot = 1 if reasoning_code == "low" else 2
-
-    m_obj = AvailableModel(
-        display_name=d_name,
-        model_name=m_name,
-        model_hash=m_hash,
-        tier_id=t_id,
-    )
-    m_obj._reasoning_slot = r_slot
-    return m_obj
+    return make_available_model(model_code, reasoning_code)
 
 @asynccontextmanager
 async def continuous_typing(bot_inst: Bot, chat_id: int, action: str = "typing"):
@@ -779,7 +749,6 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
     prefs = get_prefs(uid)
     want_img = is_image_request(prompt, prefs["tool"])
 
-    # Если просят картинку, а выбрана 3.5 Flash-Lite (в которой нет генератора картинок) — переключаем запрос на 3.8 Flash!
     effective_model_code = "flash" if (want_img and prefs["model"] == "flash-lite") else prefs["model"]
 
     files = [file_path] if file_path else None
@@ -1359,7 +1328,7 @@ def create_dispatcher(bot_inst: Bot):
         kb.button(text="🔙 Назад в Админку", callback_data="adm_back")
         try:
             await get_web_client(force_reinit=True)
-            await call.message.edit_text("✅ <b>Веб-сессия Gemini Pro переподключена, все модели восстановлены!</b>", parse_mode="HTML", reply_markup=kb.as_markup())
+            await call.message.edit_text("✅ <b>Веб-сессия Gemini Pro переподключена, все модели активны!</b>", parse_mode="HTML", reply_markup=kb.as_markup())
         except Exception as e:
             await call.message.edit_text(f"⚠️ Не удалось переподключить Веб: <code>{html.escape(str(e))}</code>", parse_mode="HTML", reply_markup=kb.as_markup())
 
@@ -1611,7 +1580,7 @@ def create_dispatcher(bot_inst: Bot):
     return d
 
 @st.cache_resource
-def launch_bot_v34():
+def launch_bot_v35():
     gen_id = time.time()
     sys._active_tg_gen = gen_id
 
@@ -1648,7 +1617,7 @@ def launch_bot_v34():
     t.start()
     return t
 
-launch_bot_v34()
+launch_bot_v35()
 
 st.title("Gemini Bot")
 st.success("Активен (@targetturtle)")

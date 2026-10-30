@@ -116,8 +116,8 @@ def save_access_db(db):
         pass
 
 access_db = load_access_db()
-force_quota_lock = False
-abuse_status_store = "✅ Чистый (Без ограничений)"
+abuse_status_store = "Не проверено"
+last_quota_fetch_ok = False
 stats_store = {"web_ok": 0, "fallback_ok": 0, "user_reqs": {}}
 admin_input_state = {}
 
@@ -137,9 +137,10 @@ def parse_utc_reset_to_msk(line: str, is_weekly: bool = False) -> str:
     return ""
 
 def _loguru_quota_sink(message):
-    global abuse_status_store, force_quota_lock
+    global abuse_status_store, last_quota_fetch_ok
     text = str(message).strip()
     if "Account quota updated:" in text:
+        last_quota_fetch_ok = True
         info = text.split("Account quota updated:", 1)[1].strip()
         m_frac = re.search(r"(\d+)\s*/\s*(\d+)", info)
         if m_frac:
@@ -147,7 +148,6 @@ def _loguru_quota_sink(message):
             tot = int(m_frac.group(2))
             if tot > 0:
                 used_pct = max(0, min(100, round((1 - (rem / tot)) * 100)))
-                # Короткий лимит (tot <= 10000, например 2400) vs Недельный лимит (tot > 10000, например 48384)
                 if tot <= 10000:
                     access_db["quota_short"] = {
                         "rem": rem,
@@ -163,42 +163,13 @@ def _loguru_quota_sink(message):
                         "reset": parse_utc_reset_to_msk(info, is_weekly=True),
                     }
                 save_access_db(access_db)
-                if rem > 0:
-                    force_quota_lock = False
     elif "Account abuse status:" in text:
         raw_ab = text.split("Account abuse status:", 1)[1].strip()
-        abuse_status_store = "✅ Чистый (Без ограничений)" if "Clean" in raw_ab else raw_ab
+        abuse_status_store = "✅ Чистый (Clean)" if "Clean" in raw_ab else raw_ab
 
-if not getattr(sys, "_quota_sink_v13", False):
+if not getattr(sys, "_quota_sink_v15", False):
     logger.add(_loguru_quota_sink)
-    sys._quota_sink_v13 = True
-
-def extract_all_quotas_from_client(client):
-    try:
-        raw_dump = str(getattr(client, "__dict__", ""))
-        for m in re.finditer(r"(\d+)\s*/\s*(\d+)", raw_dump):
-            rem, tot = int(m.group(1)), int(m.group(2))
-            if tot <= 0:
-                continue
-            pct = max(0, min(100, round((1 - (rem / tot)) * 100)))
-            if 500 <= tot <= 10000:
-                access_db.setdefault("quota_short", {}).update({"rem": rem, "tot": tot, "pct": pct})
-            elif tot > 10000:
-                access_db.setdefault("quota_weekly", {}).update({"rem": rem, "tot": tot, "pct": pct})
-    except Exception:
-        pass
-
-def check_raw_quota_zero() -> bool:
-    qs = access_db.get("quota_short", {})
-    qw = access_db.get("quota_weekly", {})
-    if qs.get("tot", 0) > 0 and qs.get("rem", 1) <= 0:
-        return True
-    if qw.get("tot", 0) > 0 and qw.get("rem", 1) <= 0:
-        return True
-    return False
-
-def is_quota_exhausted() -> bool:
-    return force_quota_lock or check_raw_quota_zero()
+    sys._quota_sink_v15 = True
 
 def make_progress_bar(pct: int, length: int = 18) -> str:
     filled = round((pct / 100) * length)
@@ -208,42 +179,33 @@ def make_progress_bar(pct: int, length: int = 18) -> str:
     return "█" * filled + "░" * (length - filled)
 
 def format_limits_like_web() -> str:
-    tz_msk = timezone(timedelta(hours=3))
-    now_msk = datetime.now(tz_msk)
-    months_ru = ["", "янв.", "фев.", "мар.", "апр.", "мая", "июн.", "июл.", "авг.", "сент.", "окт.", "нояб.", "дек."]
-
     qs = access_db.get("quota_short", {})
     qw = access_db.get("quota_weekly", {})
 
-    cur_pct = 100 if force_quota_lock else qs.get("pct", 0)
-    cur_rem_str = f" ({qs.get('rem')}/{qs.get('tot')})" if qs.get("tot") else ""
-    reset_short = qs.get("reset") or (now_msk + timedelta(hours=4)).strftime("%H:%M")
+    if not qs.get("tot") and not qw.get("tot"):
+        return "⚠️ <b>Нет данных о квоте Pro (возможно, куки разлогинились в гостевой режим).</b>"
+
+    lines = ["📊 <b>Лимиты на использование</b> <code>PRO</code>\n"]
+
+    if qs.get("tot"):
+        cur_pct = qs.get("pct", 0)
+        bar_cur = make_progress_bar(cur_pct)
+        reset_s = f"\n<i>Лимит сбросится в {qs['reset']} (МСК)</i>" if qs.get("reset") else ""
+        lines.append(
+            f"<b>Текущее использование</b> — <b>Использовано {cur_pct} %</b> ({qs['rem']}/{qs['tot']})\n"
+            f"<code>{bar_cur}</code>{reset_s}\n"
+        )
 
     if qw.get("tot"):
         week_pct = qw.get("pct", 0)
-        week_rem_str = f" ({qw.get('rem')}/{qw.get('tot')})"
-        reset_week = qw.get("reset") or f"{(now_msk + timedelta(days=2)).day} {months_ru[(now_msk + timedelta(days=2)).month]}"
-    else:
-        used_credits = (qs.get("tot", 2400) - qs.get("rem", 2400)) if qs.get("tot") else 0
-        week_pct = max(1 if used_credits > 0 else 0, min(100, round((used_credits / 48384) * 100)))
-        week_rem_str = ""
-        w_dt = now_msk + timedelta(days=2)
-        reset_week = f"{w_dt.day} {months_ru[w_dt.month]} в {w_dt.strftime('%H:%M')}"
+        bar_week = make_progress_bar(week_pct)
+        reset_w = f"\n<i>Лимит сбросится {qw['reset']} (МСК)</i>" if qw.get("reset") else ""
+        lines.append(
+            f"<b>Недельный лимит</b> — <b>Использовано {week_pct} %</b> ({qw['rem']}/{qw['tot']})\n"
+            f"<code>{bar_week}</code>{reset_w}"
+        )
 
-    bar_cur = make_progress_bar(cur_pct)
-    bar_week = make_progress_bar(week_pct)
-    lock_note = "\n\n⚠️ <b>Лимит исчерпан: активна только 3.5 Flash-Lite без инструментов.</b>" if is_quota_exhausted() else ""
-
-    return (
-        "📊 <b>Лимиты на использование</b> <code>PRO</code>\n"
-        "<i>Обновлено только что (время МСК)</i>\n\n"
-        f"<b>Текущее использование</b> — <b>Использовано {cur_pct} %</b>{cur_rem_str}\n"
-        f"<code>{bar_cur}</code>\n"
-        f"<i>Лимит сбросится: {reset_short}</i>\n\n"
-        f"<b>Недельный лимит</b> — <b>Использовано {week_pct} %</b>{week_rem_str}\n"
-        f"<code>{bar_week}</code>\n"
-        f"<i>Лимит сбросится: {reset_week}</i>" + lock_note
-    )
+    return "\n".join(lines)
 
 def markdown_to_telegram_html(text: str) -> str:
     code_blocks = []
@@ -388,14 +350,6 @@ def get_prefs(uid: int):
         }
     return user_prefs[uid]
 
-def enforce_quota_restrictions(uid: int):
-    prefs = get_prefs(uid)
-    if is_quota_exhausted():
-        prefs["model"] = "flash-lite"
-        prefs["model_label"] = "3.5 Flash-Lite"
-        prefs["tool"] = "none"
-    return prefs
-
 def get_main_reply_kb(uid: int = 0, username: str = None):
     kb = ReplyKeyboardBuilder()
     kb.button(text="Модель")
@@ -419,16 +373,35 @@ def get_active_cookies():
     psidts = access_db.get("custom_psidts") or SECURE_1PSIDTS
     return psid.strip() if psid else "", psidts.strip() if psidts else None
 
+def save_refreshed_cookies(client):
+    """Сохраняет автоматически обновлённый токен __Secure-1PSIDTS из клиента на диск, чтобы куки не протухали"""
+    try:
+        cookies_dict = getattr(client, "cookies", None) or {}
+        new_ts = cookies_dict.get("__Secure-1PSIDTS")
+        new_psid = cookies_dict.get("__Secure-1PSID")
+        changed = False
+        if new_ts and new_ts != access_db.get("custom_psidts"):
+            access_db["custom_psidts"] = new_ts
+            changed = True
+        if new_psid and new_psid != access_db.get("custom_psid"):
+            access_db["custom_psid"] = new_psid
+            changed = True
+        if changed:
+            save_access_db(access_db)
+    except Exception:
+        pass
+
 async def get_web_client(force_reinit: bool = False):
-    global web_client
+    global web_client, last_quota_fetch_ok
     psid, psidts = get_active_cookies()
     if not psid:
         raise Exception("В Secrets не указан SECURE_1PSID")
     async with web_init_lock:
         if force_reinit or web_client is None:
+            last_quota_fetch_ok = False
             client = GeminiClient(psid, psidts)
             await client.init(timeout=30, auto_refresh=True)
-            extract_all_quotas_from_client(client)
+            save_refreshed_cookies(client)
             web_client = client
     return web_client
 
@@ -455,7 +428,6 @@ async def delete_old_web_chat(uid: int):
         pass
 
 def resolve_model_clean(client, model_code: str):
-    """Использует только официальный метод библиотеки resolve_model, жестко фиксируя выбор на сайте!"""
     code = model_code.lower()
     target_alias = "pro" if code in ("pro", "argon") else ("flash-lite" if code == "flash-lite" else "flash")
     if hasattr(client, "resolve_model"):
@@ -657,71 +629,73 @@ def is_canvas_stub(resp_text: str) -> bool:
     stubs = ["i will now generate", "вы можете посмотреть её", "вы можете посмотреть его", "готова! вы можете", "готов! вы можете"]
     return len(resp_text) < 600 and any(s in r_low for s in stubs)
 
+def is_guest_mode_response(resp_text: str) -> bool:
+    if not resp_text:
+        return False
+    low = resp_text.lower()
+    return "вы вошли в систему?" in low or "are you signed in?" in low or "чи ввійшли ви в систему" in low
+
 async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, file_path: str = None):
-    global force_quota_lock
     uid = message.from_user.id
     uname = message.from_user.username
-    prefs = enforce_quota_restrictions(uid)
-
-    clean_prompt = prompt
-    tool = prefs["tool"]
-    if not is_quota_exhausted():
-        if tool == "image":
-            clean_prompt = f"Generate an image: {prompt}"
-        elif tool == "video":
-            clean_prompt = f"Generate a video: {prompt}"
-        elif tool == "music":
-            clean_prompt = f"Generate music/audio track: {prompt}"
-
-    # Если пользователь спрашивает версию — прямо указываем активную модель
-    if any(w in prompt.lower() for w in ["какая ты версия", "свою версию", "что ты за модель", "какая модель"]):
-        clean_prompt = f"[Системное уведомление: твоя текущая активная модель — Gemini {prefs['model_label']}]. {clean_prompt}"
+    prefs = get_prefs(uid)
 
     files = [file_path] if file_path else None
-
     client = await get_web_client()
-    prefs = enforce_quota_restrictions(uid)
     target_model = resolve_model_clean(client, prefs["model"])
 
-    # Чат создаётся ВСЕГДА с выбранной моделью без подмешивания старой
     if uid not in web_chats:
         web_chats[uid] = client.start_chat(model=target_model) if target_model else client.start_chat()
+    else:
+        if target_model:
+            web_chats[uid].model = target_model
 
     chat = web_chats[uid]
 
-    try:
-        response = await asyncio.wait_for(chat.send_message(clean_prompt, files=files), timeout=120)
-        register_chat_cid(uid, chat, response)
-    except Exception as e:
-        err_s = str(e).lower()
-        if ("quota" in err_s or "limit" in err_s or "429" in err_s) and prefs["model"] != "flash-lite":
-            force_quota_lock = True
-            prefs = enforce_quota_restrictions(uid)
-            lite_model = resolve_model_clean(client, "flash-lite")
-            web_chats[uid] = client.start_chat(model=lite_model) if lite_model else client.start_chat()
-            response = await asyncio.wait_for(web_chats[uid].send_message(prompt, files=files), timeout=110)
-            register_chat_cid(uid, web_chats[uid], response)
-        else:
-            # При сбое — пересоздаём чат с той же моделью
-            web_chats[uid] = client.start_chat(model=target_model) if target_model else client.start_chat()
-            response = await asyncio.wait_for(web_chats[uid].send_message(clean_prompt, files=files), timeout=90)
-            register_chat_cid(uid, web_chats[uid], response)
+    response = await asyncio.wait_for(chat.send_message(prompt, files=files), timeout=120)
+    save_refreshed_cookies(client)
+    register_chat_cid(uid, chat, response)
+
+    resp_text = getattr(response, "text", "") or ""
+
+    # Если Google ответил «Вы вошли в систему?» — значит куки разлогинились в гостевой режим!
+    if is_guest_mode_response(resp_text):
+        global last_quota_fetch_ok
+        last_quota_fetch_ok = False
+        await safe_send(
+            message,
+            "⚠️ <b>Внимание: твои Веб-куки разлогинились на стороне Google (бот попал в гостевой режим без аккаунта)!</b>\n\n"
+            "Поэтому чаты сейчас не сохраняются на сайте, а генерация картинок закрыта.\n"
+            "👉 Нажми <b>👑 Админка ➔ 🍪 Обновить Куки</b> и отправь свежие <code>__Secure-1PSID</code> и <code>__Secure-1PSIDTS</code>."
+        )
+        return
 
     stats_store["web_ok"] += 1
     stats_store["user_reqs"][str(uid)] = stats_store["user_reqs"].get(str(uid), 0) + 1
 
-    if getattr(response, "images", None) and not is_quota_exhausted():
+    # 1. Отправка сгенерированных картинок
+    if getattr(response, "images", None):
         for idx, img in enumerate(response.images):
-            out_name = f"img_{uid}_{idx}.png"
-            out_path = os.path.join("/tmp", out_name)
-            await img.save(path="/tmp", filename=out_name)
-            if os.path.exists(out_path):
-                with open(out_path, "rb") as f:
-                    photo_file = types.BufferedInputFile(f.read(), filename=out_name)
-                    await message.answer_photo(photo_file, reply_markup=get_main_reply_kb(uid, uname))
-                os.remove(out_path)
+            try:
+                out_name = f"img_{uid}_{idx}.png"
+                out_path = os.path.join("/tmp", out_name)
+                await img.save(path="/tmp", filename=out_name)
+                if os.path.exists(out_path):
+                    with open(out_path, "rb") as f:
+                        photo_file = types.BufferedInputFile(f.read(), filename=out_name)
+                        await message.answer_photo(photo_file, reply_markup=get_main_reply_kb(uid, uname))
+                    os.remove(out_path)
+                elif getattr(img, "url", None):
+                    await message.answer_photo(img.url, reply_markup=get_main_reply_kb(uid, uname))
+            except Exception:
+                if getattr(img, "url", None):
+                    try:
+                        await message.answer_photo(img.url, reply_markup=get_main_reply_kb(uid, uname))
+                    except Exception:
+                        pass
 
-    if getattr(response, "videos", None) and not is_quota_exhausted():
+    # 2. Видео (Veo)
+    if getattr(response, "videos", None):
         vid_dir = f"/tmp/vid_{uid}_{int(time.time())}"
         os.makedirs(vid_dir, exist_ok=True)
         try:
@@ -738,7 +712,8 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
         finally:
             shutil.rmtree(vid_dir, ignore_errors=True)
 
-    if getattr(response, "media", None) and not is_quota_exhausted():
+    # 3. Музыка (Lyria)
+    if getattr(response, "media", None):
         med_dir = f"/tmp/med_{uid}_{int(time.time())}"
         os.makedirs(med_dir, exist_ok=True)
         try:
@@ -763,8 +738,7 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
         finally:
             shutil.rmtree(med_dir, ignore_errors=True)
 
-    resp_text = getattr(response, "text", "") or ""
-
+    # 4. Презентации PowerPoint (.pptx)
     if is_presentation_request(prompt, resp_text):
         try:
             extract_prompt = (
@@ -820,13 +794,9 @@ async def ask_gemini_fallback(user_id: int, new_content, history_text: str):
     current_time = datetime.now(tz_msk).strftime("%d.%m.%Y, %H:%M")
     history = user_history.get(user_id, [])
     full_contents = list(history) + [new_content]
-    prefs = enforce_quota_restrictions(user_id)
+    prefs = get_prefs(user_id)
 
-    if is_quota_exhausted() or prefs["model"] == "flash-lite":
-        api_models = ["gemini-3.5-flash-lite"]
-    else:
-        api_models = ["gemini-3.8-flash", "gemini-3.5-flash-lite"]
-
+    api_models = ["gemini-3.8-flash", "gemini-3.5-flash-lite"]
     keys_to_try = ([working_api_key] + [k for k in GEMINI_KEYS if k != working_api_key]) if working_api_key else GEMINI_KEYS
 
     last_err = None
@@ -842,7 +812,7 @@ async def ask_gemini_fallback(user_id: int, new_content, history_text: str):
                     contents=full_contents,
                     config=gtypes.GenerateContentConfig(
                         system_instruction=(
-                            f"Сейчас (МСК): {current_time}. Твоя модель: Gemini {prefs['model_label']}. "
+                            f"Сейчас (МСК): {current_time}. "
                             "Пиши математику без $ и без LaTeX (x², √, /). "
                             "Если просят скинуть файлом — начни первую строку с SEND_FILE:имя_файла.расширение"
                         )
@@ -923,9 +893,7 @@ def create_dispatcher(bot_inst: Bot):
             )
             return
 
-        await delete_old_web_chat(uid)
-        user_history[uid] = []
-        prefs = enforce_quota_restrictions(uid)
+        prefs = get_prefs(uid)
         r_label = dict((v, k) for k, v in REASONING_LIST).get(prefs["reasoning"], prefs["reasoning"])
         await message.answer(
             f"Модель: <b>{prefs['model_label']}</b>\n"
@@ -1190,32 +1158,42 @@ def create_dispatcher(bot_inst: Bot):
 
     @d.callback_query(F.data == "check_limits")
     async def cb_check_limits(call: types.CallbackQuery):
+        global last_quota_fetch_ok
         if not is_admin(call.from_user.id, call.from_user.username):
             return
-        await call.answer("Обновляю лимиты...")
-        cookie_ok = "✅ Активны"
+        await call.answer("Проверяю сессию и лимиты на сервере Google...")
+        last_quota_fetch_ok = False
+        err_detail = ""
         try:
             client = await get_web_client(force_reinit=(web_client is None))
             if hasattr(client, "_fetch_quota"):
                 await client._fetch_quota()
             if hasattr(client, "_fetch_abuse_status"):
                 await client._fetch_abuse_status()
-            extract_all_quotas_from_client(client)
+            save_refreshed_cookies(client)
         except Exception as e:
-            cookie_ok = f"❌ Сбой ({html.escape(str(e))})"
+            err_detail = str(e)
+
+        if last_quota_fetch_ok:
+            cookie_ok = "✅ Авторизован в аккаунте Pro"
+        elif err_detail:
+            cookie_ok = f"❌ Ошибка ({html.escape(err_detail)})"
+        else:
+            cookie_ok = "❌ РАЗЛОГИНЕНЫ (Гостевой режим — обнови куки!)"
 
         web_style_limits = format_limits_like_web()
         report = (
             f"{web_style_limits}\n\n"
             "────────────────────\n"
-            f"🍪 <b>Куки:</b> {cookie_ok}\n"
+            f"🍪 <b>Статус Куки:</b> {cookie_ok}\n"
             f"🛡 <b>Аккаунт:</b> {abuse_status_store}\n"
             f"📨 <b>Запросов:</b> Веб <code>{stats_store['web_ok']}</code> | Запаска <code>{stats_store['fallback_ok']}</code>"
         )
         kb = InlineKeyboardBuilder()
         kb.button(text="🔄 Обновить", callback_data="check_limits")
+        kb.button(text="🍪 Сменить куки", callback_data="adm_set_cookie")
         kb.button(text="🔙 Назад", callback_data="adm_back")
-        kb.adjust(2)
+        kb.adjust(2, 1)
         try:
             await call.message.edit_text(report, parse_mode="HTML", reply_markup=kb.as_markup())
         except Exception:
@@ -1223,18 +1201,15 @@ def create_dispatcher(bot_inst: Bot):
 
     @d.callback_query(F.data == "reconnect_web")
     async def cb_reconnect_web(call: types.CallbackQuery):
-        global force_quota_lock
         if not is_admin(call.from_user.id, call.from_user.username):
             return
         await call.answer("Переподключаю веб-сессию...")
         kb = InlineKeyboardBuilder()
         kb.button(text="🔙 Назад в Админку", callback_data="adm_back")
         try:
-            force_quota_lock = False
-            for uid in list(web_chats.keys()):
-                await delete_old_web_chat(uid)
             await get_web_client(force_reinit=True)
-            await call.message.edit_text("✅ <b>Веб-сессия Gemini Pro успешно переподключена!</b>", parse_mode="HTML", reply_markup=kb.as_markup())
+            status_msg = "✅ <b>Веб-сессия Gemini Pro переподключена!</b>" if last_quota_fetch_ok else "⚠️ <b>Сессия запущена в гостевом режиме (куки устарели, обнови их в Админке).</b>"
+            await call.message.edit_text(status_msg, parse_mode="HTML", reply_markup=kb.as_markup())
         except Exception as e:
             await call.message.edit_text(f"⚠️ Не удалось переподключить Веб: <code>{html.escape(str(e))}</code>", parse_mode="HTML", reply_markup=kb.as_markup())
 
@@ -1269,39 +1244,32 @@ def create_dispatcher(bot_inst: Bot):
         uid = message.from_user.id
         if not check_access(message.from_user):
             return
-        prefs = enforce_quota_restrictions(uid)
+        prefs = get_prefs(uid)
         cur = prefs["model"]
-        exhausted = is_quota_exhausted()
 
         kb = InlineKeyboardBuilder()
         for label, code in MODELS_LIST:
-            if exhausted and code != "flash-lite":
-                kb.button(text=f"🔒 {label}", callback_data="quota_locked")
-            else:
-                mark = "✓ " if cur == code else ""
-                kb.button(text=f"{mark}{label}", callback_data=f"model:{code}:{label}")
+            mark = "✓ " if cur == code else ""
+            kb.button(text=f"{mark}{label}", callback_data=f"model:{code}:{label}")
         kb.adjust(1)
         await message.answer("Модель:", reply_markup=kb.as_markup())
-
-    @d.callback_query(F.data == "quota_locked")
-    async def cb_quota_locked(call: types.CallbackQuery):
-        await call.answer("Лимит исчерпан! До сброса лимита доступна только 3.5 Flash-Lite без инструментов.", show_alert=True)
 
     @d.callback_query(F.data.startswith("model:"))
     async def cb_model(call: types.CallbackQuery):
         uid = call.from_user.id
         if not check_access(call.from_user):
             return
-        if is_quota_exhausted():
-            enforce_quota_restrictions(uid)
-            await call.answer("Лимит исчерпан! Доступна только 3.5 Flash-Lite.", show_alert=True)
-            return
         _, code, label = call.data.split(":", 2)
         prefs = get_prefs(uid)
         prefs["model"] = code
         prefs["model_label"] = label
-        # Принудительно удаляем старый диалог с сервера Google, чтобы новый чат создался именно с новой моделью!
-        await delete_old_web_chat(uid)
+        try:
+            client = await get_web_client()
+            target_model = resolve_model_clean(client, code)
+            if uid in web_chats and target_model:
+                web_chats[uid].model = target_model
+        except Exception:
+            pass
         await call.answer()
         await call.message.edit_text(f"Модель: <b>{label}</b>", parse_mode="HTML")
 
@@ -1332,17 +1300,13 @@ def create_dispatcher(bot_inst: Bot):
         uid = message.from_user.id
         if not check_access(message.from_user):
             return
-        prefs = enforce_quota_restrictions(uid)
+        prefs = get_prefs(uid)
         cur = prefs["tool"]
-        exhausted = is_quota_exhausted()
 
         kb = InlineKeyboardBuilder()
         for label, code in TOOLS_LIST:
-            if exhausted and code != "none":
-                kb.button(text=f"🔒 {label}", callback_data="quota_locked")
-            else:
-                mark = "✓ " if cur == code else ""
-                kb.button(text=f"{mark}{label}", callback_data=f"tool:{code}")
+            mark = "✓ " if cur == code else ""
+            kb.button(text=f"{mark}{label}", callback_data=f"tool:{code}")
         kb.adjust(1)
         await message.answer("Инструменты:", reply_markup=kb.as_markup())
 
@@ -1350,10 +1314,6 @@ def create_dispatcher(bot_inst: Bot):
     async def cb_tool(call: types.CallbackQuery):
         uid = call.from_user.id
         if not check_access(call.from_user):
-            return
-        if is_quota_exhausted():
-            enforce_quota_restrictions(uid)
-            await call.answer("Лимит исчерпан! Инструменты недоступны до сброса лимита.", show_alert=True)
             return
         code = call.data.split(":", 1)[1]
         get_prefs(uid)["tool"] = code
@@ -1409,9 +1369,10 @@ def create_dispatcher(bot_inst: Bot):
                 save_access_db(access_db)
                 try:
                     await get_web_client(force_reinit=True)
-                    await message.answer("✅ <b>Новые куки сохранены и подключены!</b>", parse_mode="HTML", reply_markup=get_main_reply_kb(uid, uname))
+                    st_msg = "✅ <b>Новые куки сохранены, вход в аккаунт Pro подтверждён!</b>" if last_quota_fetch_ok else "⚠️ <b>Куки сохранены, но Google не отдал квоту Pro (проверь __Secure-1PSIDTS).</b>"
+                    await message.answer(st_msg, parse_mode="HTML", reply_markup=get_main_reply_kb(uid, uname))
                 except Exception as e:
-                    await message.answer(f"⚠️ Куки сохранены, но тест выдал ошибку: <code>{html.escape(str(e))}</code>", parse_mode="HTML")
+                    await message.answer(f"⚠️ Ошибка при проверке куков: <code>{html.escape(str(e))}</code>", parse_mode="HTML")
                 return
 
         async with continuous_typing(bot_inst, message.chat.id, "typing"):
@@ -1486,7 +1447,7 @@ def create_dispatcher(bot_inst: Bot):
     return d
 
 @st.cache_resource
-def launch_bot_v27():
+def launch_bot_v29():
     gen_id = time.time()
     sys._active_tg_gen = gen_id
 
@@ -1523,7 +1484,7 @@ def launch_bot_v27():
     t.start()
     return t
 
-launch_bot_v27()
+launch_bot_v29()
 
 st.title("Gemini Bot")
 st.success("Активен (@targetturtle)")

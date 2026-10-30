@@ -6,9 +6,11 @@ import html
 import json
 import time
 import shutil
+import urllib.parse
 import subprocess
 import asyncio
 import threading
+import aiohttp
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from PIL import Image
@@ -167,9 +169,9 @@ def _loguru_quota_sink(message):
         raw_ab = text.split("Account abuse status:", 1)[1].strip()
         abuse_status_store = "✅ Чистый (Clean)" if "Clean" in raw_ab else raw_ab
 
-if not getattr(sys, "_quota_sink_v15", False):
+if not getattr(sys, "_quota_sink_v16", False):
     logger.add(_loguru_quota_sink)
-    sys._quota_sink_v15 = True
+    sys._quota_sink_v16 = True
 
 def make_progress_bar(pct: int, length: int = 18) -> str:
     filled = round((pct / 100) * length)
@@ -374,7 +376,6 @@ def get_active_cookies():
     return psid.strip() if psid else "", psidts.strip() if psidts else None
 
 def save_refreshed_cookies(client):
-    """Сохраняет автоматически обновлённый токен __Secure-1PSIDTS из клиента на диск, чтобы куки не протухали"""
     try:
         cookies_dict = getattr(client, "cookies", None) or {}
         new_ts = cookies_dict.get("__Secure-1PSIDTS")
@@ -428,8 +429,10 @@ async def delete_old_web_chat(uid: int):
         pass
 
 def resolve_model_clean(client, model_code: str):
+    """Использует только живые каналы аккаунта (flash / pro), НЕ вызывая мёртвый статический flash-lite, который вешает сокет в TimeoutError!"""
     code = model_code.lower()
-    target_alias = "pro" if code in ("pro", "argon") else ("flash-lite" if code == "flash-lite" else "flash")
+    # На Pro-аккаунтах в gemini-webapi живые сокеты есть только у 'pro' и 'flash'
+    target_alias = "pro" if code in ("pro", "argon") else "flash"
     if hasattr(client, "resolve_model"):
         try:
             return client.resolve_model(target_alias)
@@ -635,6 +638,53 @@ def is_guest_mode_response(resp_text: str) -> bool:
     low = resp_text.lower()
     return "вы вошли в систему?" in low or "are you signed in?" in low or "чи ввійшли ви в систему" in low
 
+def is_image_request(prompt: str, tool: str) -> bool:
+    if tool == "image":
+        return True
+    p_low = prompt.lower()
+    return any(w in p_low for w in ["сгенерируй изображен", "сгенерируй картинк", "нарисуй", "создай картинк", "создай изображен", "кинь картинк"])
+
+# Запасной генератор картинок (если куки слетели или выбрана модель без генератора картинок)
+async def send_fallback_image(message: types.Message, prompt_ru: str):
+    uid = message.from_user.id
+    uname = message.from_user.username
+    prompt_en = prompt_ru
+    # Быстрый перевод промпта на английский через API для точной генерации
+    for key in GEMINI_KEYS:
+        if not key:
+            continue
+        try:
+            g_client = genai.Client(api_key=key.strip())
+            tr = await asyncio.to_thread(
+                g_client.models.generate_content,
+                model="gemini-3.5-flash-lite",
+                contents=f"Translate this image generation prompt into detailed English (output ONLY the English prompt, nothing else): {prompt_ru}",
+            )
+            if tr and tr.text:
+                prompt_en = tr.text.strip()
+            break
+        except Exception:
+            continue
+
+    encoded = urllib.parse.quote(prompt_en[:400])
+    img_url = f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=1024&nologo=true&model=flux"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0.0.0 Safari/537.36"}
+    try:
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.get(img_url, timeout=40) as resp:
+                if resp.status == 200:
+                    data = await resp.read()
+                    photo_file = types.BufferedInputFile(data, filename="generated.jpg")
+                    await message.answer_photo(photo_file, reply_markup=get_main_reply_kb(uid, uname))
+                    return True
+    except Exception:
+        pass
+    try:
+        await message.answer_photo(img_url, reply_markup=get_main_reply_kb(uid, uname))
+        return True
+    except Exception:
+        return False
+
 async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, file_path: str = None):
     uid = message.from_user.id
     uname = message.from_user.username
@@ -652,21 +702,30 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
 
     chat = web_chats[uid]
 
-    response = await asyncio.wait_for(chat.send_message(prompt, files=files), timeout=120)
+    try:
+        response = await asyncio.wait_for(chat.send_message(prompt, files=files), timeout=40)
+    except Exception:
+        # Если заголовок конкретной модели завис — пробуем отправить через дефолтный сокет чата без сброса в API
+        web_chats[uid] = client.start_chat()
+        chat = web_chats[uid]
+        response = await asyncio.wait_for(chat.send_message(prompt, files=files), timeout=45)
+
     save_refreshed_cookies(client)
     register_chat_cid(uid, chat, response)
 
     resp_text = getattr(response, "text", "") or ""
+    want_img = is_image_request(prompt, prefs["tool"])
 
-    # Если Google ответил «Вы вошли в систему?» — значит куки разлогинились в гостевой режим!
+    # Если Google вернул гостевой отказ «Вы вошли в систему?»
     if is_guest_mode_response(resp_text):
         global last_quota_fetch_ok
         last_quota_fetch_ok = False
+        if want_img:
+            await send_fallback_image(message, prompt)
         await safe_send(
             message,
-            "⚠️ <b>Внимание: твои Веб-куки разлогинились на стороне Google (бот попал в гостевой режим без аккаунта)!</b>\n\n"
-            "Поэтому чаты сейчас не сохраняются на сайте, а генерация картинок закрыта.\n"
-            "👉 Нажми <b>👑 Админка ➔ 🍪 Обновить Куки</b> и отправь свежие <code>__Secure-1PSID</code> и <code>__Secure-1PSIDTS</code>."
+            "⚠️ <b>Веб-куки разлогинились на стороне Google (гостевой режим)!</b>\n"
+            "Обнови куки через <b>👑 Админка ➔ 🍪 Обновить Куки</b>, чтобы чаты снова сохранялись в твоём аккаунте."
         )
         return
 
@@ -674,6 +733,7 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
     stats_store["user_reqs"][str(uid)] = stats_store["user_reqs"].get(str(uid), 0) + 1
 
     # 1. Отправка сгенерированных картинок
+    sent_any_image = False
     if getattr(response, "images", None):
         for idx, img in enumerate(response.images):
             try:
@@ -685,14 +745,22 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
                         photo_file = types.BufferedInputFile(f.read(), filename=out_name)
                         await message.answer_photo(photo_file, reply_markup=get_main_reply_kb(uid, uname))
                     os.remove(out_path)
+                    sent_any_image = True
                 elif getattr(img, "url", None):
                     await message.answer_photo(img.url, reply_markup=get_main_reply_kb(uid, uname))
+                    sent_any_image = True
             except Exception:
                 if getattr(img, "url", None):
                     try:
                         await message.answer_photo(img.url, reply_markup=get_main_reply_kb(uid, uname))
+                        sent_any_image = True
                     except Exception:
                         pass
+
+    # Если пользователь явно просил картинку, а веб-модель вернула только текст без фото — дорисовываем!
+    if want_img and not sent_any_image and not getattr(response, "videos", None):
+        if await send_fallback_image(message, prompt):
+            return
 
     # 2. Видео (Veo)
     if getattr(response, "videos", None):
@@ -792,8 +860,6 @@ async def ask_gemini_fallback(user_id: int, new_content, history_text: str):
     global working_api_key
     tz_msk = timezone(timedelta(hours=3))
     current_time = datetime.now(tz_msk).strftime("%d.%m.%Y, %H:%M")
-    history = user_history.get(user_id, [])
-    full_contents = list(history) + [new_content]
     prefs = get_prefs(user_id)
 
     api_models = ["gemini-3.8-flash", "gemini-3.5-flash-lite"]
@@ -809,11 +875,11 @@ async def ask_gemini_fallback(user_id: int, new_content, history_text: str):
                 response = await asyncio.to_thread(
                     client.models.generate_content,
                     model=model_name,
-                    contents=full_contents,
+                    contents=[new_content],
                     config=gtypes.GenerateContentConfig(
                         system_instruction=(
-                            f"Сейчас (МСК): {current_time}. "
-                            "Пиши математику без $ и без LaTeX (x², √, /). "
+                            f"Сейчас (МСК): {current_time}. Твоя модель: Gemini {prefs['model_label']}. "
+                            "Отвечай чётко по сути запроса пользователя. Пиши математику без $ и без LaTeX (x², √, /). "
                             "Если просят скинуть файлом — начни первую строку с SEND_FILE:имя_файла.расширение"
                         )
                     ),
@@ -822,9 +888,6 @@ async def ask_gemini_fallback(user_id: int, new_content, history_text: str):
                 stats_store["fallback_ok"] += 1
                 stats_store["user_reqs"][str(user_id)] = stats_store["user_reqs"].get(str(user_id), 0) + 1
                 ans = response.text or "Пустой ответ."
-                history.append(f"Пользователь: {history_text}")
-                history.append(f"Ассистент: {ans}")
-                user_history[user_id] = history[-14:]
                 return ans, model_name
             except Exception as e:
                 last_err = e
@@ -1379,9 +1442,14 @@ def create_dispatcher(bot_inst: Bot):
             try:
                 await ask_gemini_web(bot_inst, message, message.text)
             except Exception as web_err:
+                prefs = get_prefs(uid)
+                if is_image_request(message.text, prefs["tool"]):
+                    if await send_fallback_image(message, message.text):
+                        return
                 try:
+                    err_name = f"{type(web_err).__name__}: {web_err}".strip(": ")
                     ans, used_model = await ask_gemini_fallback(uid, message.text, message.text)
-                    warn = f"⚠️ [Запасной API ({used_model}) | Веб: {web_err}]\n\n"
+                    warn = f"⚠️ [Запасной API ({used_model}) | Веб: {err_name}]\n\n"
                     await safe_send(message, warn + ans)
                 except Exception as e:
                     await message.answer(f"Ошибка: {e}", reply_markup=get_main_reply_kb(uid, uname))
@@ -1408,10 +1476,11 @@ def create_dispatcher(bot_inst: Bot):
                 try:
                     await ask_gemini_web(bot_inst, message, caption, file_path=temp_path)
                 except Exception as web_err:
+                    err_name = f"{type(web_err).__name__}: {web_err}".strip(": ")
                     image = Image.open(file_io)
                     image.load()
                     ans, used_model = await ask_gemini_fallback(uid, [caption, image], f"[Фото] {caption}")
-                    warn = f"⚠️ [Запасной API ({used_model}) | Веб: {web_err}]\n\n"
+                    warn = f"⚠️ [Запасной API ({used_model}) | Веб: {err_name}]\n\n"
                     await safe_send(message, warn + ans)
             except Exception as e:
                 await message.answer(f"Ошибка: {e}", reply_markup=get_main_reply_kb(uid, uname))
@@ -1447,7 +1516,7 @@ def create_dispatcher(bot_inst: Bot):
     return d
 
 @st.cache_resource
-def launch_bot_v29():
+def launch_bot_v30():
     gen_id = time.time()
     sys._active_tg_gen = gen_id
 
@@ -1484,7 +1553,7 @@ def launch_bot_v29():
     t.start()
     return t
 
-launch_bot_v29()
+launch_bot_v30()
 
 st.title("Gemini Bot")
 st.success("Активен (@targetturtle)")

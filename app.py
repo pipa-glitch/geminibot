@@ -20,17 +20,15 @@ import streamlit as st
 TMP_PKGS = "/tmp/pypkgs"
 os.makedirs(TMP_PKGS, exist_ok=True)
 if TMP_PKGS not in sys.path:
-    sys.path.append(TMP_PKGS)  # В конец sys.path, чтобы не дублировать системные пакеты!
+    sys.path.append(TMP_PKGS)
 
 try:
     from gemini_webapi import GeminiClient, AvailableModel
-    from gemini_webapi.constants import GrpcId
-    from gemini_webapi.types import RPCData
+    import gemini_webapi.client as _gw_client
 except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "--target", TMP_PKGS, "-U", "gemini-webapi"])
     from gemini_webapi import GeminiClient, AvailableModel
-    from gemini_webapi.constants import GrpcId
-    from gemini_webapi.types import RPCData
+    import gemini_webapi.client as _gw_client
 
 try:
     from gemini_webapi.utils import rotate_1psidts
@@ -153,6 +151,60 @@ stats_store = {"web_ok": 0, "fallback_ok": 0, "user_reqs": {}}
 admin_input_state = {}
 pending_grant_target = {}
 
+def parse_utc_reset_to_msk(line: str, is_weekly: bool = False) -> str:
+    tz_msk = timezone(timedelta(hours=3))
+    m_dt = re.search(r"(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})\s*UTC", line)
+    if m_dt:
+        try:
+            dt_utc = datetime.strptime(f"{m_dt.group(1)} {m_dt.group(2)}", "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            dt_msk = dt_utc.astimezone(tz_msk)
+            months_ru = ["", "янв.", "фев.", "мар.", "апр.", "мая", "июн.", "июл.", "авг.", "сент.", "окт.", "нояб.", "дек."]
+            if is_weekly or (dt_msk.date() != datetime.now(tz_msk).date()):
+                return f"{dt_msk.day} {months_ru[dt_msk.month]} в {dt_msk.strftime('%H:%M')}"
+            return dt_msk.strftime("%H:%M")
+        except Exception:
+            pass
+    return ""
+
+def _loguru_quota_sink(message):
+    global abuse_status_store, last_quota_fetch_ok
+    text = str(message).strip()
+    if "Account quota updated:" in text:
+        last_quota_fetch_ok = True
+        info = text.split("Account quota updated:", 1)[1].strip()
+        m_frac = re.search(r"(\d+)\s*/\s*(\d+)", info)
+        if m_frac:
+            rem = int(m_frac.group(1))
+            tot = int(m_frac.group(2))
+            if tot > 0:
+                used_pct = max(0, min(100, round((1 - (rem / tot)) * 100)))
+                if tot <= 10000:
+                    access_db["quota_short"] = {
+                        "rem": rem,
+                        "tot": tot,
+                        "pct": used_pct,
+                        "reset": parse_utc_reset_to_msk(info, is_weekly=False),
+                    }
+                else:
+                    access_db["quota_weekly"] = {
+                        "rem": rem,
+                        "tot": tot,
+                        "pct": used_pct,
+                        "reset": parse_utc_reset_to_msk(info, is_weekly=True),
+                    }
+                save_access_db(access_db)
+    elif "Account abuse status:" in text:
+        raw_ab = text.split("Account abuse status:", 1)[1].strip()
+        abuse_status_store = "✅ Чистый (Clean)" if "Clean" in raw_ab else raw_ab
+
+# Подключаемся напрямую к внутреннему логгеру модуля gemini_webapi.client!
+if hasattr(_gw_client, "logger") and not getattr(_gw_client, "_sink_attached_v38", False):
+    try:
+        _gw_client.logger.add(_loguru_quota_sink)
+        _gw_client._sink_attached_v38 = True
+    except Exception:
+        pass
+
 def parse_custom_duration(text: str) -> tuple[int, str]:
     s = text.lower().strip()
     if s in ("0", "навсегда", "бессрочно", "forever", "inf"):
@@ -211,83 +263,87 @@ def build_duration_picker_kb(target_key: str):
     kb.adjust(2, 2, 1, 1)
     return kb.as_markup()
 
-# Прямое чтение таблицы квот Google через RPC qp93dd (без зависимости от loguru!)
 async def fetch_real_quotas_direct(client) -> bool:
     global last_quota_fetch_ok
     tz_msk = timezone(timedelta(hours=3))
     months_ru = ["", "янв.", "фев.", "мар.", "апр.", "мая", "июн.", "июл.", "авг.", "сент.", "окт.", "нояб.", "дек."]
-    try:
-        response = await client._batch_execute([RPCData(rpcid=GrpcId.QUOTA, payload="[]")])
-        if not response or response.status_code != 200:
-            return False
 
-        found_any = False
-        for line in response.text.splitlines():
-            if "qp93dd" not in line:
-                continue
-            try:
-                outer = json.loads(line)
-                inner_str = next(
-                    (
-                        item[2]
-                        for item in outer
-                        if isinstance(item, list) and len(item) > 2 and item[1] == "qp93dd" and item[2]
-                    ),
-                    None,
-                )
-                if not inner_str:
-                    continue
-                data = json.loads(inner_str)
-            except Exception:
-                continue
+    # 1. Вызываем штатный _fetch_quota (перехватывается через _gw_client.logger)
+    if hasattr(client, "_fetch_quota"):
+        try:
+            await client._fetch_quota()
+        except Exception:
+            pass
 
-            entries = data[0] if isinstance(data, list) and data else None
-            if not isinstance(entries, list):
-                continue
+    # 2. Дополнительно напрямую запрашиваем пакет qp93dd через _batch_execute
+    rpc_cls = getattr(_gw_client, "RPCData", None)
+    if rpc_cls and hasattr(client, "_batch_execute"):
+        try:
+            response = await client._batch_execute([rpc_cls(rpcid="qp93dd", payload="[]")])
+            if response and response.status_code == 200:
+                for line in response.text.splitlines():
+                    if "qp93dd" not in line:
+                        continue
+                    try:
+                        outer = json.loads(line)
+                        inner_str = next(
+                            (
+                                item[2]
+                                for item in outer
+                                if isinstance(item, list) and len(item) > 2 and item[1] == "qp93dd" and item[2]
+                            ),
+                            None,
+                        )
+                        if not inner_str:
+                            continue
+                        data = json.loads(inner_str)
+                    except Exception:
+                        continue
 
-            for entry in entries:
-                if not isinstance(entry, list) or len(entry) < 3:
-                    continue
-                rem = entry[1]
-                tot = entry[13] if len(entry) > 13 else None
-                reset_ts = (
-                    entry[7][0]
-                    if len(entry) > 7 and isinstance(entry[7], list) and entry[7]
-                    else None
-                )
-                if isinstance(rem, int) and isinstance(tot, int) and tot > 0:
-                    found_any = True
-                    used_pct = max(0, min(100, round((1 - (rem / tot)) * 100)))
-                    reset_msk_str = ""
-                    if reset_ts:
-                        dt_msk = datetime.fromtimestamp(reset_ts, tz=tz_msk)
-                        if dt_msk.date() != datetime.now(tz_msk).date() or tot > 10000:
-                            reset_msk_str = f"{dt_msk.day} {months_ru[dt_msk.month]} в {dt_msk.strftime('%H:%M')}"
-                        else:
-                            reset_msk_str = dt_msk.strftime("%H:%M")
+                    entries = data[0] if isinstance(data, list) and data else None
+                    if not isinstance(entries, list):
+                        continue
 
-                    if tot <= 10000:
-                        access_db["quota_short"] = {
-                            "rem": rem,
-                            "tot": tot,
-                            "pct": used_pct,
-                            "reset": reset_msk_str,
-                        }
-                    else:
-                        access_db["quota_weekly"] = {
-                            "rem": rem,
-                            "tot": tot,
-                            "pct": used_pct,
-                            "reset": reset_msk_str,
-                        }
+                    for entry in entries:
+                        if not isinstance(entry, list) or len(entry) < 3:
+                            continue
+                        rem = entry[1]
+                        tot = entry[13] if len(entry) > 13 else None
+                        reset_ts = (
+                            entry[7][0]
+                            if len(entry) > 7 and isinstance(entry[7], list) and entry[7]
+                            else None
+                        )
+                        if isinstance(rem, int) and isinstance(tot, int) and tot > 0:
+                            last_quota_fetch_ok = True
+                            used_pct = max(0, min(100, round((1 - (rem / tot)) * 100)))
+                            reset_msk_str = ""
+                            if reset_ts:
+                                dt_msk = datetime.fromtimestamp(reset_ts, tz=tz_msk)
+                                if dt_msk.date() != datetime.now(tz_msk).date() or tot > 10000:
+                                    reset_msk_str = f"{dt_msk.day} {months_ru[dt_msk.month]} в {dt_msk.strftime('%H:%M')}"
+                                else:
+                                    reset_msk_str = dt_msk.strftime("%H:%M")
 
-        if found_any:
-            last_quota_fetch_ok = True
-            save_access_db(access_db)
-            return True
-    except Exception as e:
-        print(f"[!] Ошибка прямого чтения квот: {e}")
-    return False
+                            if tot <= 10000:
+                                access_db["quota_short"] = {
+                                    "rem": rem,
+                                    "tot": tot,
+                                    "pct": used_pct,
+                                    "reset": reset_msk_str,
+                                }
+                            else:
+                                access_db["quota_weekly"] = {
+                                    "rem": rem,
+                                    "tot": tot,
+                                    "pct": used_pct,
+                                    "reset": reset_msk_str,
+                                }
+                save_access_db(access_db)
+        except Exception as e:
+            print(f"[!] Ошибка прямого чтения qp93dd: {e}")
+
+    return last_quota_fetch_ok
 
 def inject_missing_models_into_client(client):
     try:
@@ -1798,7 +1854,7 @@ def create_dispatcher(bot_inst: Bot):
     return d
 
 @st.cache_resource
-def launch_bot_v37():
+def launch_bot_v38():
     gen_id = time.time()
     sys._active_tg_gen = gen_id
 
@@ -1835,7 +1891,7 @@ def launch_bot_v37():
     t.start()
     return t
 
-launch_bot_v37()
+launch_bot_v38()
 
 st.title("Gemini Bot")
 st.success("Активен (@targetturtle)")

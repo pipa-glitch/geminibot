@@ -4,6 +4,7 @@ import io
 import re
 import html
 import json
+import copy
 import time
 import shutil
 import urllib.parse
@@ -174,9 +175,9 @@ def _loguru_quota_sink(message):
         raw_ab = text.split("Account abuse status:", 1)[1].strip()
         abuse_status_store = "✅ Чистый (Clean)" if "Clean" in raw_ab else raw_ab
 
-if not getattr(sys, "_quota_sink_v17", False):
+if not getattr(sys, "_quota_sink_v18", False):
     logger.add(_loguru_quota_sink)
-    sys._quota_sink_v17 = True
+    sys._quota_sink_v18 = True
 
 def make_progress_bar(pct: int, length: int = 18) -> str:
     filled = round((pct / 100) * length)
@@ -397,7 +398,6 @@ def save_refreshed_cookies(client):
     except Exception:
         pass
 
-# Автоматическое получение свежего __Secure-1PSIDTS по вечному __Secure-1PSID без участия пользователя!
 async def auto_rotate_cookie_ts(psid: str, old_psidts: str = None):
     if not rotate_1psidts or not psid:
         return None
@@ -429,7 +429,6 @@ async def get_web_client(force_reinit: bool = False):
             except Exception:
                 web_client = None
 
-            # Если старый 1PSIDTS протух (не отдал квоту Pro) — АВТОМАТИЧЕСКИ крутим куки через RotateCookies!
             if not last_quota_fetch_ok or web_client is None:
                 rotated_ts = await auto_rotate_cookie_ts(psid, psidts)
                 for candidate_ts in ([rotated_ts, None] if rotated_ts else [None]):
@@ -467,15 +466,71 @@ async def delete_old_web_chat(uid: int):
     except Exception:
         pass
 
-def resolve_model_clean(client, model_code: str):
+def apply_reasoning_to_model(model_obj, reasoning_code: str):
+    """Устанавливает слот уровня рассуждений (Низкий=1, Средний=2, Высокий=3/2) внутри заголовка модели, не ломая её ID"""
+    if model_obj is None:
+        return None
+    try:
+        m_copy = copy.deepcopy(model_obj)
+        hdr = getattr(m_copy, "model_header", None)
+        if isinstance(hdr, dict) and "x-goog-ext-525001261-jspb" in hdr:
+            arr = json.loads(hdr["x-goog-ext-525001261-jspb"])
+            if isinstance(arr, list):
+                r_map = {"low": 1, "medium": 2, "high": 3}
+                r_val = r_map.get(reasoning_code, 1)
+                while len(arr) <= 15:
+                    arr.append(None)
+                arr[15] = r_val
+                hdr["x-goog-ext-525001261-jspb"] = json.dumps(arr, separators=(",", ":"))
+                return m_copy
+    except Exception:
+        pass
+    return model_obj
+
+def resolve_model_clean(client, model_code: str, reasoning_code: str = "low"):
+    """Ищет точную модель (включая Argon и Flash-Lite) без принудительной подмены Argon -> Pro и применяет уровень рассуждений"""
     code = model_code.lower()
-    target_alias = "pro" if code in ("pro", "argon") else "flash"
-    if hasattr(client, "resolve_model"):
+    found = None
+
+    # 1. Сначала ищем точное совпадение в списке моделей аккаунта (list_models)
+    if hasattr(client, "list_models"):
         try:
-            return client.resolve_model(target_alias)
+            models = client.list_models() or []
+            for m in models:
+                d_name = str(getattr(m, "display_name", "")).lower()
+                m_name = str(getattr(m, "model_name", "")).lower()
+                both = f"{d_name} {m_name}"
+                if code == "argon" and ("argon" in both or "4" in both or "ultra" in both or "exp" in both):
+                    found = m
+                    break
+                if code == "flash-lite" and ("lite" in both or "3.5" in both):
+                    found = m
+                    break
+                if code == "pro" and "pro" in both and "argon" not in both:
+                    found = m
+                    break
+                if code == "flash" and "flash" in both and "lite" not in both:
+                    found = m
+                    break
         except Exception:
             pass
-    return None
+
+    # 2. Пробуем resolve_model напрямую по коду (не подменяя argon на pro заранее!)
+    if found is None and hasattr(client, "resolve_model"):
+        candidates = [code]
+        if code == "argon":
+            candidates = ["argon", "4-argon", "gemini-4", "pro"]
+        elif code == "flash-lite":
+            candidates = ["flash-lite", "3.5-flash-lite", "flash"]
+        for cand in candidates:
+            try:
+                found = client.resolve_model(cand)
+                if found is not None:
+                    break
+            except Exception:
+                continue
+
+    return apply_reasoning_to_model(found, reasoning_code)
 
 @asynccontextmanager
 async def continuous_typing(bot_inst: Bot, chat_id: int, action: str = "typing"):
@@ -727,7 +782,7 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
 
     files = [file_path] if file_path else None
     client = await get_web_client()
-    target_model = resolve_model_clean(client, prefs["model"])
+    target_model = resolve_model_clean(client, prefs["model"], prefs["reasoning"])
 
     if uid not in web_chats:
         web_chats[uid] = client.start_chat(model=target_model) if target_model else client.start_chat()
@@ -740,7 +795,9 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
     try:
         response = await asyncio.wait_for(chat.send_message(prompt, files=files), timeout=40)
     except Exception:
-        web_chats[uid] = client.start_chat()
+        # Если модифицированный слот рассуждений вызвал сбой — пробуем чистую модель без слота 15
+        base_m = resolve_model_clean(client, prefs["model"], "low")
+        web_chats[uid] = client.start_chat(model=base_m) if base_m else client.start_chat()
         chat = web_chats[uid]
         response = await asyncio.wait_for(chat.send_message(prompt, files=files), timeout=45)
 
@@ -750,10 +807,9 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
     resp_text = getattr(response, "text", "") or ""
     want_img = is_image_request(prompt, prefs["tool"])
 
-    # Если Google ответил «Вы вошли в систему?» — АВТОМАТИЧЕСКИ обновляем 1PSIDTS через RotateCookies и повторяем запрос!
     if is_guest_mode_response(resp_text):
         client = await get_web_client(force_reinit=True)
-        target_model = resolve_model_clean(client, prefs["model"])
+        target_model = resolve_model_clean(client, prefs["model"], prefs["reasoning"])
         web_chats[uid] = client.start_chat(model=target_model) if target_model else client.start_chat()
         chat = web_chats[uid]
         response = await asyncio.wait_for(chat.send_message(prompt, files=files), timeout=45)
@@ -761,7 +817,6 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
         register_chat_cid(uid, chat, response)
         resp_text = getattr(response, "text", "") or ""
 
-        # Если даже после авто-ротации Google не пустил (значит умер сам полугодовой 1PSID)
         if is_guest_mode_response(resp_text):
             global last_quota_fetch_ok
             last_quota_fetch_ok = False
@@ -770,7 +825,7 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
             await safe_send(
                 message,
                 "⚠️ **Главный куки (__Secure-1PSID) был сброшен браузером!**\n"
-                "Открой `gemini.google.com` в режиме **Инкогнито**, скопируй куки один раз через **👑 Админка ➔ 🍪 Обновить Куки** и сразу закрой окно Инкогнито — тогда они больше не будут слетать."
+                "Открой `gemini.google.com` в режиме **Инкогнито**, скопируй куки один раз через **👑 Админка ➔ 🍪 Обновить Куки** и сразу закрой окно Инкогнито."
             )
             return
 
@@ -941,6 +996,7 @@ def build_admin_panel_view():
 
     kb = InlineKeyboardBuilder()
     kb.button(text="📊 Лимиты и Куки", callback_data="check_limits")
+    kb.button(text="🔍 Модели на аккаунте", callback_data="adm_inspect_models")
     kb.button(text="➕ Дать доступ по @юзу", callback_data="adm_add_user")
     kb.button(text="👑 Выдать / Снять Админку", callback_data="adm_manage_admins")
     kb.button(text=f"Режим: {mode_str}", callback_data="adm_toggle_mode")
@@ -1137,6 +1193,28 @@ def create_dispatcher(bot_inst: Bot):
         admin_input_state.pop(call.from_user.id, None)
         text, markup = build_admin_panel_view()
         await call.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
+
+    @d.callback_query(F.data == "adm_inspect_models")
+    async def cb_adm_inspect_models(call: types.CallbackQuery):
+        if not is_admin(call.from_user.id, call.from_user.username):
+            return
+        await call.answer("Считываю модели клиента...")
+        kb = InlineKeyboardBuilder()
+        kb.button(text="🔙 Назад", callback_data="adm_back")
+        try:
+            client = await get_web_client()
+            models = client.list_models() if hasattr(client, "list_models") else []
+            out = ["🔍 <b>Модели, обнаруженные на аккаунте:</b>\n"]
+            for m in models:
+                d_n = html.escape(str(getattr(m, "display_name", "")))
+                m_n = html.escape(str(getattr(m, "model_name", "")))
+                hdr = html.escape(str(getattr(m, "model_header", "")))
+                out.append(f"• <b>{d_n}</b> (<code>{m_n}</code>)\n<code>{hdr}</code>\n")
+            if not models:
+                out.append("Список list_models() пуст.")
+            await call.message.edit_text("\n".join(out)[:3900], parse_mode="HTML", reply_markup=kb.as_markup())
+        except Exception as e:
+            await call.message.edit_text(f"Ошибка: <code>{html.escape(str(e))}</code>", parse_mode="HTML", reply_markup=kb.as_markup())
 
     @d.callback_query(F.data == "adm_toggle_mode")
     async def cb_adm_toggle_mode(call: types.CallbackQuery):
@@ -1368,7 +1446,7 @@ def create_dispatcher(bot_inst: Bot):
         prefs["model_label"] = label
         try:
             client = await get_web_client()
-            target_model = resolve_model_clean(client, code)
+            target_model = resolve_model_clean(client, code, prefs["reasoning"])
             if uid in web_chats and target_model:
                 web_chats[uid].model = target_model
         except Exception:
@@ -1390,10 +1468,20 @@ def create_dispatcher(bot_inst: Bot):
 
     @d.callback_query(F.data.startswith("reason:"))
     async def cb_reason(call: types.CallbackQuery):
+        uid = call.from_user.id
         if not check_access(call.from_user):
             return
         code = call.data.split(":", 1)[1]
-        get_prefs(call.from_user.id)["reasoning"] = code
+        prefs = get_prefs(uid)
+        prefs["reasoning"] = code
+        # Сразу обновляем заголовок модели в текущем чате с новым уровнем рассуждений!
+        try:
+            client = await get_web_client()
+            target_model = resolve_model_clean(client, prefs["model"], code)
+            if uid in web_chats and target_model:
+                web_chats[uid].model = target_model
+        except Exception:
+            pass
         label = dict((v, k) for k, v in REASONING_LIST).get(code, code)
         await call.answer()
         await call.message.edit_text(f"Уровень рассуждений: <b>{label}</b>", parse_mode="HTML")
@@ -1556,7 +1644,7 @@ def create_dispatcher(bot_inst: Bot):
     return d
 
 @st.cache_resource
-def launch_bot_v31():
+def launch_bot_v32():
     gen_id = time.time()
     sys._active_tg_gen = gen_id
 
@@ -1593,7 +1681,7 @@ def launch_bot_v31():
     t.start()
     return t
 
-launch_bot_v31()
+launch_bot_v32()
 
 st.title("Gemini Bot")
 st.success("Активен (@targetturtle)")

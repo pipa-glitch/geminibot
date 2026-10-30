@@ -7,12 +7,16 @@ import time
 import subprocess
 import asyncio
 import threading
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from PIL import Image
 import streamlit as st
 
 try:
     from gemini_webapi import GeminiClient
+    if not hasattr(GeminiClient, "delete_chat"):
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-U", "gemini-webapi"])
+        from gemini_webapi import GeminiClient
 except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "-U", "gemini-webapi"])
     from gemini_webapi import GeminiClient
@@ -50,16 +54,38 @@ def _loguru_quota_sink(message):
         info = text.split("Account quota updated:", 1)[1].strip()
         m_key = info.split("-")[0].strip()
         quota_by_model[m_key] = info
-        # Проверяем, не обновился ли лимит
         if not check_raw_quota_zero():
             force_quota_lock = False
     elif "Account abuse status:" in text:
         raw_ab = text.split("Account abuse status:", 1)[1].strip()
         abuse_status_store = "✅ Чистый (Без ограничений)" if "Clean" in raw_ab else raw_ab
 
-if not getattr(sys, "_quota_sink_v3", False):
+if not getattr(sys, "_quota_sink_v4", False):
     logger.add(_loguru_quota_sink)
-    sys._quota_sink_v3 = True
+    sys._quota_sink_v4 = True
+
+# Непрерывный статус «печатает...» до самого момента отправки ответа
+@asynccontextmanager
+async def continuous_typing(bot_inst: Bot, chat_id: int, action: str = "typing"):
+    stop_event = asyncio.Event()
+
+    async def _loop():
+        while not stop_event.is_set():
+            try:
+                await bot_inst.send_chat_action(chat_id=chat_id, action=action)
+            except Exception:
+                pass
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=4.0)
+            except asyncio.TimeoutError:
+                pass
+
+    task = asyncio.create_task(_loop())
+    try:
+        yield
+    finally:
+        stop_event.set()
+        task.cancel()
 
 def check_raw_quota_zero() -> bool:
     for line in quota_by_model.values():
@@ -141,7 +167,7 @@ def load_access_db():
                 return json.load(f)
         except Exception:
             pass
-    return {"admin_id": None, "users": {}, "custom_psid": "", "custom_psidts": ""}
+    return {"admin_id": None, "users": {}, "custom_psid": "", "custom_psidts": "", "user_cids": {}}
 
 def save_access_db(db):
     try:
@@ -151,6 +177,24 @@ def save_access_db(db):
         pass
 
 access_db = load_access_db()
+
+def register_chat_cid(uid: int, *objs):
+    """Сохраняет ID чата (cid) на диск, чтобы гарантированно удалить его при создании нового"""
+    cids = access_db.setdefault("user_cids", {}).setdefault(str(uid), [])
+    changed = False
+    for obj in objs:
+        if obj is None:
+            continue
+        cid = getattr(obj, "cid", None)
+        if not cid and getattr(obj, "metadata", None):
+            meta = getattr(obj, "metadata", None)
+            if isinstance(meta, (list, tuple)) and len(meta) > 0:
+                cid = meta[0]
+        if cid and isinstance(cid, str) and cid not in cids:
+            cids.append(cid)
+            changed = True
+    if changed:
+        save_access_db(access_db)
 
 def is_admin(uid: int) -> bool:
     return access_db.get("admin_id") == uid
@@ -243,17 +287,28 @@ async def get_web_client(force_reinit: bool = False):
             web_client = client
     return web_client
 
+# Гарантированное удаление всех старых чатов пользователя с серверов gemini.google.com
 async def delete_old_web_chat(uid: int):
     old_chat = web_chats.pop(uid, None)
-    if old_chat is not None and web_client is not None:
-        try:
-            cid = getattr(old_chat, "cid", None)
-            if not cid and getattr(old_chat, "metadata", None):
-                cid = old_chat.metadata[0]
-            if cid and hasattr(web_client, "delete_chat"):
-                await web_client.delete_chat(cid)
-        except Exception:
-            pass
+    if old_chat is not None:
+        register_chat_cid(uid, old_chat)
+
+    saved_cids = list(access_db.get("user_cids", {}).get(str(uid), []))
+    if not saved_cids:
+        return
+
+    try:
+        client = await get_web_client()
+        if hasattr(client, "delete_chat"):
+            for cid in saved_cids:
+                try:
+                    await client.delete_chat(cid)
+                except Exception:
+                    pass
+        access_db.setdefault("user_cids", {})[str(uid)] = []
+        save_access_db(access_db)
+    except Exception:
+        pass
 
 def resolve_clean_model(client, model_code: str):
     code = model_code.lower()
@@ -342,22 +397,18 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
             prefs = enforce_quota_restrictions(uid)
             target_model = resolve_clean_model(client, prefs["model"])
 
+            # Если создается новый чат — сначала удаляем предыдущий чат пользователя с сайта
             if attempt == 1 or uid not in web_chats:
+                await delete_old_web_chat(uid)
                 web_chats[uid] = client.start_chat(model=target_model) if target_model else client.start_chat()
-            else:
-                old_chat = web_chats[uid]
-                if target_model:
-                    try:
-                        web_chats[uid] = client.start_chat(model=target_model, metadata=old_chat.metadata)
-                    except Exception:
-                        old_chat.model = target_model
 
             chat = web_chats[uid]
             response = await asyncio.wait_for(chat.send_message(clean_prompt, files=files), timeout=45)
+            # Сразу фиксируем cid созданного диалога на диск
+            register_chat_cid(uid, chat, response)
             break
         except Exception as e:
             err_s = str(e).lower()
-            # Если Google вернул ошибку исчерпания лимита Pro — принудительно переключаем на 3.5 Flash-Lite без инструментов
             if ("quota" in err_s or "limit" in err_s or "429" in err_s) and prefs["model"] != "flash-lite":
                 force_quota_lock = True
                 prefs = enforce_quota_restrictions(uid)
@@ -375,7 +426,6 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
     stats_store["user_reqs"][str(uid)] = stats_store["user_reqs"].get(str(uid), 0) + 1
 
     if getattr(response, "images", None) and not is_quota_exhausted():
-        await bot_inst.send_chat_action(chat_id=message.chat.id, action="upload_photo")
         for idx, img in enumerate(response.images):
             out_name = f"img_{uid}_{idx}.png"
             out_path = os.path.join("/tmp", out_name)
@@ -579,6 +629,7 @@ def create_dispatcher(bot_inst: Bot):
         kb = InlineKeyboardBuilder()
         kb.button(text="📊 Лимиты и проверка Куки", callback_data="check_limits")
         kb.button(text="🔄 Переподключить Веб-Gemini", callback_data="reconnect_web")
+        kb.button(text="🗑 Очистить ВСЕ чаты на сайте", callback_data="wipe_all_chats")
 
         lines = ["👑 **Админ-панель**\n"]
         now = time.time()
@@ -600,6 +651,35 @@ def create_dispatcher(bot_inst: Bot):
         save_access_db(access_db)
         kb.adjust(1)
         await message.answer("\n".join(lines), parse_mode="Markdown", reply_markup=kb.as_markup())
+
+    @d.callback_query(F.data == "wipe_all_chats")
+    async def cb_wipe_all_chats(call: types.CallbackQuery):
+        if not is_admin(call.from_user.id):
+            return
+        await call.answer("Удаляю все чаты с сайта Gemini...")
+        deleted_count = 0
+        try:
+            client = await get_web_client()
+            # 1. Удаляем все сохраненные в базе cid
+            for uid_str in list(access_db.get("user_cids", {}).keys()):
+                await delete_old_web_chat(int(uid_str))
+                deleted_count += 1
+            # 2. Если поддерживается list_chats — вычищаем вообще всю боковую панель на сайте
+            if hasattr(client, "list_chats") and hasattr(client, "delete_chat"):
+                chats = await client.list_chats()
+                if chats:
+                    for ch in chats:
+                        cid = getattr(ch, "cid", None)
+                        if cid:
+                            try:
+                                await client.delete_chat(cid)
+                                deleted_count += 1
+                            except Exception:
+                                pass
+            web_chats.clear()
+            await call.message.edit_text(f"🗑 **Готово! Удалено чатов с сайта Gemini: {deleted_count}**", parse_mode="Markdown")
+        except Exception as e:
+            await call.message.edit_text(f"⚠️ Ошибка при очистке чатов: `{e}`", parse_mode="Markdown")
 
     @d.callback_query(F.data == "check_limits")
     async def cb_check_limits(call: types.CallbackQuery):
@@ -669,7 +749,7 @@ def create_dispatcher(bot_inst: Bot):
             return
         await delete_old_web_chat(uid)
         user_history[uid] = []
-        await message.answer("Старый чат удалён, начат новый.", reply_markup=get_main_reply_kb(uid))
+        await message.answer("Старый чат удалён с сайта, начат новый.", reply_markup=get_main_reply_kb(uid))
 
     @d.message(F.text == "Модель")
     async def menu_models(message: types.Message):
@@ -705,8 +785,11 @@ def create_dispatcher(bot_inst: Bot):
             return
         _, code, label = call.data.split(":", 2)
         prefs = get_prefs(uid)
-        prefs["model"] = code
-        prefs["model_label"] = label
+        if prefs["model"] != code:
+            prefs["model"] = code
+            prefs["model_label"] = label
+            # При смене модели сразу удаляем старый чат с сайта, чтобы не было конфликта моделей
+            await delete_old_web_chat(uid)
         await call.answer()
         await call.message.edit_text(f"Модель: *{label}*", parse_mode="Markdown")
 
@@ -773,16 +856,16 @@ def create_dispatcher(bot_inst: Bot):
             await message.answer("🔒 Доступ закрыт. Отправь заявку владельцу:", reply_markup=get_locked_kb())
             return
 
-        await bot_inst.send_chat_action(chat_id=message.chat.id, action="typing")
-        try:
-            await ask_gemini_web(bot_inst, message, message.text)
-        except Exception as web_err:
+        async with continuous_typing(bot_inst, message.chat.id, "typing"):
             try:
-                ans, used_model = await ask_gemini_fallback(uid, message.text, message.text)
-                warn = f"⚠️ [Запасной API ({used_model}) | Веб: {web_err}]\n\n"
-                await safe_send(message, warn + ans)
-            except Exception as e:
-                await message.answer(f"Ошибка: {e}", reply_markup=get_main_reply_kb(uid))
+                await ask_gemini_web(bot_inst, message, message.text)
+            except Exception as web_err:
+                try:
+                    ans, used_model = await ask_gemini_fallback(uid, message.text, message.text)
+                    warn = f"⚠️ [Запасной API ({used_model}) | Веб: {web_err}]\n\n"
+                    await safe_send(message, warn + ans)
+                except Exception as e:
+                    await message.answer(f"Ошибка: {e}", reply_markup=get_main_reply_kb(uid))
 
     @d.message(F.photo)
     async def handle_photo(message: types.Message):
@@ -791,30 +874,30 @@ def create_dispatcher(bot_inst: Bot):
             await message.answer("🔒 Доступ закрыт. Отправь заявку владельцу:", reply_markup=get_locked_kb())
             return
 
-        await bot_inst.send_chat_action(chat_id=message.chat.id, action="typing")
         temp_path = f"/tmp/photo_{uid}.jpg"
-        try:
-            photo = message.photo[-1]
-            file_io = io.BytesIO()
-            await bot_inst.download(photo, destination=file_io)
-            file_io.seek(0)
-            with open(temp_path, "wb") as f:
-                f.write(file_io.getvalue())
-
-            caption = message.caption or "Реши или опиши фото."
+        async with continuous_typing(bot_inst, message.chat.id, "typing"):
             try:
-                await ask_gemini_web(bot_inst, message, caption, file_path=temp_path)
-            except Exception as web_err:
-                image = Image.open(file_io)
-                image.load()
-                ans, used_model = await ask_gemini_fallback(uid, [caption, image], f"[Фото] {caption}")
-                warn = f"⚠️ [Запасной API ({used_model}) | Веб: {web_err}]\n\n"
-                await safe_send(message, warn + ans)
-        except Exception as e:
-            await message.answer(f"Ошибка: {e}", reply_markup=get_main_reply_kb(uid))
-        finally:
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
+                photo = message.photo[-1]
+                file_io = io.BytesIO()
+                await bot_inst.download(photo, destination=file_io)
+                file_io.seek(0)
+                with open(temp_path, "wb") as f:
+                    f.write(file_io.getvalue())
+
+                caption = message.caption or "Реши или опиши фото."
+                try:
+                    await ask_gemini_web(bot_inst, message, caption, file_path=temp_path)
+                except Exception as web_err:
+                    image = Image.open(file_io)
+                    image.load()
+                    ans, used_model = await ask_gemini_fallback(uid, [caption, image], f"[Фото] {caption}")
+                    warn = f"⚠️ [Запасной API ({used_model}) | Веб: {web_err}]\n\n"
+                    await safe_send(message, warn + ans)
+            except Exception as e:
+                await message.answer(f"Ошибка: {e}", reply_markup=get_main_reply_kb(uid))
+            finally:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
 
     @d.message(F.document)
     async def handle_document(message: types.Message):
@@ -823,27 +906,27 @@ def create_dispatcher(bot_inst: Bot):
             await message.answer("🔒 Доступ закрыт. Отправь заявку владельцу:", reply_markup=get_locked_kb())
             return
 
-        await bot_inst.send_chat_action(chat_id=message.chat.id, action="typing")
         doc = message.document
         temp_path = os.path.join("/tmp", doc.file_name or f"file_{uid}")
-        try:
-            file_io = io.BytesIO()
-            await bot_inst.download(doc, destination=file_io)
-            with open(temp_path, "wb") as f:
-                f.write(file_io.getvalue())
+        async with continuous_typing(bot_inst, message.chat.id, "typing"):
+            try:
+                file_io = io.BytesIO()
+                await bot_inst.download(doc, destination=file_io)
+                with open(temp_path, "wb") as f:
+                    f.write(file_io.getvalue())
 
-            caption = message.caption or "Проанализируй файл."
-            await ask_gemini_web(bot_inst, message, caption, file_path=temp_path)
-        except Exception as e:
-            await message.answer(f"Ошибка файла: {e}", reply_markup=get_main_reply_kb(uid))
-        finally:
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
+                caption = message.caption or "Проанализируй файл."
+                await ask_gemini_web(bot_inst, message, caption, file_path=temp_path)
+            except Exception as e:
+                await message.answer(f"Ошибка файла: {e}", reply_markup=get_main_reply_kb(uid))
+            finally:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
 
     return d
 
 @st.cache_resource
-def launch_bot_v17():
+def launch_bot_v18():
     gen_id = time.time()
     sys._active_tg_gen = gen_id
 
@@ -880,7 +963,7 @@ def launch_bot_v17():
     t.start()
     return t
 
-launch_bot_v17()
+launch_bot_v18()
 
 st.title("Gemini Bot")
 st.success("Активен")

@@ -1,4 +1,4 @@
-import os, sys, io, re, html, json, time, shutil, urllib.parse, subprocess, asyncio, threading, aiohttp
+import os, sys, io, re, html, json, time, shutil, subprocess, asyncio, threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from PIL import Image, ImageOps
@@ -61,7 +61,6 @@ GEMINI_KEYS = list(get_secret("GEMINI_KEYS", []))
 OWNER_USERNAME = "targetturtle"
 ACCESS_FILE = "access_db.json"
 
-# Индекс 11 всегда строго 1, чтобы Google никогда не сбрасывал авторизацию заголовка!
 FULL_MODELS_CATALOG = {
     "flash-lite": ("3.5 Flash-Lite", "gemini-flash-lite", "cf41b0e0dd7d53e5", 6),
     "flash": ("3.8 Flash", "gemini-flash", "56fdd199312815e2", 11),
@@ -69,21 +68,40 @@ FULL_MODELS_CATALOG = {
     "argon": ("4 Argon", "gemini-argon", "e6fa609c3fa255c0", 4),
 }
 
-def make_available_model(code: str) -> AvailableModel:
+def make_available_model(client, code: str) -> AvailableModel:
     d_name, m_name, m_hash, t_id = FULL_MODELS_CATALOG.get(code.lower(), FULL_MODELS_CATALOG["flash"])
     hdr = {
         "x-goog-ext-525001261-jspb": f'[1,null,null,null,"{m_hash}",null,null,0,[4,5,6,8],null,null,1, null,null,{t_id}]',
         "x-goog-ext-73010989-jspb": "[0]",
         "x-goog-ext-73010990-jspb": "[0,0,0]",
     }
-    return AvailableModel(
-        model_id=m_hash,
-        model_name=m_name,
-        display_name=d_name,
-        description=d_name,
-        capacity=t_id,
-        model_header=hdr,
-    )
+    # Клонируем существующий валидный объект AvailableModel из клиента, чтобы Pydantic никогда не выдавал ValidationError!
+    if client and hasattr(client, "list_models"):
+        try:
+            existing = client.list_models() or []
+            if existing:
+                base = existing[0]
+                if hasattr(base, "model_copy"):
+                    return base.model_copy(update={"display_name": d_name, "model_header": hdr})
+        except Exception:
+            pass
+    try:
+        return AvailableModel(
+            model_id=m_hash,
+            display_name=d_name,
+            description=d_name,
+            capacity=t_id,
+            model_header=hdr,
+        )
+    except Exception:
+        return AvailableModel(
+            model_id=m_hash,
+            model_name=m_name,
+            display_name=d_name,
+            description=d_name,
+            capacity=t_id,
+            model_header=hdr,
+        )
 
 def load_access_db():
     if os.path.exists(ACCESS_FILE):
@@ -153,10 +171,10 @@ def _loguru_quota_sink(message):
         raw_ab = text.split("Account abuse status:", 1)[1].strip()
         abuse_status_store = "✅ Чистый (Clean)" if "Clean" in raw_ab else raw_ab
 
-if hasattr(_gw_client, "logger") and not getattr(_gw_client, "_sink_v42", False):
+if hasattr(_gw_client, "logger") and not getattr(_gw_client, "_sink_v44", False):
     try:
         _gw_client.logger.add(_loguru_quota_sink)
-        _gw_client._sink_v42 = True
+        _gw_client._sink_v44 = True
     except Exception:
         pass
 
@@ -198,6 +216,7 @@ def build_duration_picker_kb(target_key: str):
     kb.adjust(2, 2, 1, 1)
     return kb.as_markup()
 
+# Читаем реальные квоты: remaining = entry[1], total = entry[2] (как в исходнике gemini_webapi!)
 async def refresh_live_quotas(client) -> bool:
     if hasattr(client, "_fetch_quota"):
         try: await client._fetch_quota()
@@ -222,7 +241,7 @@ async def refresh_live_quotas(client) -> bool:
                     for entry in entries:
                         if not isinstance(entry, list) or len(entry) < 3: continue
                         rem = entry[1]
-                        tot = entry[13] if len(entry) > 13 else None
+                        tot = entry[2] if isinstance(entry[2], int) and entry[2] > 0 else (entry[13] if len(entry) > 13 else None)
                         reset_ts = entry[7][0] if len(entry) > 7 and isinstance(entry[7], list) and entry[7] else None
                         if isinstance(rem, int) and isinstance(tot, int) and tot > 0:
                             used_pct = max(0, min(100, round((1 - (rem / tot)) * 100)))
@@ -238,17 +257,6 @@ async def refresh_live_quotas(client) -> bool:
         except Exception: pass
     return bool(access_db.get("quota_short", {}).get("tot") or access_db.get("quota_weekly", {}).get("tot"))
 
-def inject_missing_models_into_client(client):
-    try:
-        models_dict = getattr(client, "_models", None)
-        if isinstance(models_dict, dict):
-            for key in FULL_MODELS_CATALOG:
-                m_obj = make_available_model(key)
-                models_dict[m_obj.model_name] = m_obj
-    except Exception:
-        pass
-
-# Чистый вывод лимитов ТОЛЬКО в процентах (без полосок!)
 def format_limits_clean(uid: int = None) -> str:
     tz_msk = timezone(timedelta(hours=3))
     now_msk = datetime.now(tz_msk)
@@ -382,7 +390,6 @@ def get_prefs(uid: int):
         user_prefs[uid] = {"model": "flash", "model_label": "3.8 Flash", "reasoning": "low", "tool": "none"}
     return user_prefs[uid]
 
-# Кнопка «📊 Лимиты» теперь доступна всем пользователям, а «👑 Админка» — только админам
 def get_main_reply_kb(uid: int = 0, username: str = None):
     kb = ReplyKeyboardBuilder()
     kb.button(text="Модель")
@@ -414,12 +421,11 @@ async def get_web_client(force_reinit: bool = False):
         raise Exception("Не указан SECURE_1PSID")
     async with web_init_lock:
         if force_reinit or web_client is None:
+            web_chats.clear()  # Сразу очищаем старые привязанные чаты при смене клиента!
             client = GeminiClient(psid, psidts)
             await client.init(timeout=30, auto_refresh=True, refresh_interval=300)
-            inject_missing_models_into_client(client)
+            await refresh_live_quotas(client)
             web_client = client
-    if web_client is not None:
-        inject_missing_models_into_client(web_client)
     return web_client
 
 async def delete_old_web_chat(uid: int):
@@ -439,8 +445,7 @@ async def delete_old_web_chat(uid: int):
         pass
 
 def resolve_model_clean(client, model_code: str) -> AvailableModel:
-    inject_missing_models_into_client(client)
-    return make_available_model(model_code)
+    return make_available_model(client, model_code)
 
 @asynccontextmanager
 async def continuous_typing(bot_inst: Bot, chat_id: int, action: str = "typing"):
@@ -457,14 +462,6 @@ async def continuous_typing(bot_inst: Bot, chat_id: int, action: str = "typing")
         stop_event.set()
         task.cancel()
 
-def parse_requested_dimensions(prompt: str) -> tuple[int, int]:
-    m = re.search(r"(\d{3,4})\s*[xх×*]\s*(\d{3,4})", prompt.lower())
-    if m:
-        w, h = int(m.group(1)), int(m.group(2))
-        if 100 <= w <= 2048 and 100 <= h <= 2048:
-            return w, h
-    return 1024, 1024
-
 def resize_image_bytes_if_needed(img_bytes: bytes, prompt: str) -> bytes:
     m = re.search(r"(\d{3,4})\s*[xх×*]\s*(\d{3,4})", prompt.lower())
     if not m:
@@ -480,68 +477,6 @@ def resize_image_bytes_if_needed(img_bytes: bytes, prompt: str) -> bytes:
     except Exception:
         pass
     return img_bytes
-
-def is_image_intent(prompt: str, tool: str) -> bool:
-    if tool == "image":
-        return True
-    p_low = prompt.lower()
-    return any(w in p_low for w in ["нарисуй", "сгенерируй", "создай картинк", "создай изображен", "баннер", "логотип", "кинь картинк", "арт ", "обои"])
-
-def is_image_refusal(resp_text: str) -> bool:
-    if not resp_text:
-        return False
-    low = resp_text.lower()
-    refusals = [
-        "вы вошли в систему?",
-        "не могу создавать их для вас",
-        "недоступно в вашем регионе",
-        "я могу искать изображения, но",
-        "не умею создавать изображения",
-        "can't create them for you",
-    ]
-    return any(r in low for r in refusals)
-
-# Безотказная генерация картинки (если веб-чат выдал региональный отказ или сработала запаска)
-async def generate_guaranteed_image(message: types.Message, prompt_ru: str) -> bool:
-    uid, uname = message.from_user.id, message.from_user.username
-    w, h = parse_requested_dimensions(prompt_ru)
-
-    # 1. Пробуем через Gemini Image API, если есть ключи
-    prompt_en = prompt_ru
-    for key in GEMINI_KEYS:
-        if not key: continue
-        try:
-            g_client = genai.Client(api_key=key.strip())
-            tr = await asyncio.to_thread(
-                g_client.models.generate_content,
-                model="gemini-3.5-flash-lite",
-                contents=f"Convert this request into a vivid, detailed English image generation prompt (output ONLY the English prompt, no quotes, no size numbers): {prompt_ru}",
-            )
-            if tr and tr.text:
-                prompt_en = tr.text.strip()
-            break
-        except Exception:
-            continue
-
-    encoded = urllib.parse.quote(prompt_en[:450])
-    img_url = f"https://image.pollinations.ai/prompt/{encoded}?width={w}&height={h}&nologo=true&model=flux&seed={int(time.time()) % 10000}"
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0.0.0 Safari/537.36"}
-    try:
-        async with aiohttp.ClientSession(headers=headers) as session:
-            async with session.get(img_url, timeout=45) as resp:
-                if resp.status == 200:
-                    raw_data = await resp.read()
-                    final_bytes = resize_image_bytes_if_needed(raw_data, prompt_ru)
-                    photo_file = types.BufferedInputFile(final_bytes, filename="image.png")
-                    await message.answer_photo(photo_file, reply_markup=get_main_reply_kb(uid, uname))
-                    return True
-    except Exception:
-        pass
-    try:
-        await message.answer_photo(img_url, reply_markup=get_main_reply_kb(uid, uname))
-        return True
-    except Exception:
-        return False
 
 def build_canvas_pptx(slides_data: list) -> bytes:
     if not HAS_PPTX: return b""
@@ -614,12 +549,10 @@ def is_canvas_stub(resp_text: str) -> bool:
 async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, file_path: str = None):
     uid, uname = message.from_user.id, message.from_user.username
     prefs = get_prefs(uid)
-    want_img = is_image_intent(prompt, prefs["tool"])
 
-    effective_code = "flash" if (want_img and prefs["model"] == "flash-lite") else prefs["model"]
     files = [file_path] if file_path else None
     client = await get_web_client()
-    target_model = resolve_model_clean(client, effective_code)
+    target_model = resolve_model_clean(client, prefs["model"])
 
     if uid not in web_chats:
         web_chats[uid] = client.start_chat(model=target_model)
@@ -627,15 +560,14 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
         web_chats[uid].model = target_model
 
     chat = web_chats[uid]
-    send_prompt = f"Generate an image: {prompt}" if (want_img and not file_path) else prompt
-    response = await asyncio.wait_for(chat.send_message(send_prompt, files=files), timeout=90)
+    response = await asyncio.wait_for(chat.send_message(prompt, files=files), timeout=90)
     register_chat_cid(uid, chat, response)
 
     resp_text = getattr(response, "text", "") or ""
     stats_store["web_ok"] += 1
     stats_store["user_reqs"][str(uid)] = stats_store["user_reqs"].get(str(uid), 0) + 1
 
-    sent_img = False
+    # Отправка ТОЛЬКО родных картинок из ответа Gemini Web (никакого Pollinations!)
     if getattr(response, "images", None):
         for idx, img in enumerate(response.images):
             try:
@@ -647,21 +579,12 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
                         img_b = resize_image_bytes_if_needed(f.read(), prompt)
                         await message.answer_photo(types.BufferedInputFile(img_b, filename=out_name), reply_markup=get_main_reply_kb(uid, uname))
                     os.remove(out_path)
-                    sent_img = True
                 elif getattr(img, "url", None):
                     await message.answer_photo(img.url, reply_markup=get_main_reply_kb(uid, uname))
-                    sent_img = True
             except Exception:
                 if getattr(img, "url", None):
-                    try:
-                        await message.answer_photo(img.url, reply_markup=get_main_reply_kb(uid, uname))
-                        sent_img = True
+                    try: await message.answer_photo(img.url, reply_markup=get_main_reply_kb(uid, uname))
                     except Exception: pass
-
-    # Если просили нарисовать картинку, а сайт выдал региональный отказ «Вы вошли в систему?» или не дал картинку — рисуем картинку без показа текста отказа!
-    if (want_img or is_image_refusal(resp_text)) and not sent_img:
-        if await generate_guaranteed_image(message, prompt):
-            return
 
     if getattr(response, "videos", None):
         vid_dir = f"/tmp/vid_{uid}_{int(time.time())}"
@@ -717,7 +640,7 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
         except Exception:
             pass
 
-    if resp_text and not is_image_refusal(resp_text):
+    if resp_text:
         await safe_send(message, resp_text)
 
 async def ask_gemini_fallback(user_id: int, new_content, history_text: str):
@@ -810,7 +733,7 @@ def build_admin_panel_view():
         f"📨 Запросов: Веб <code>{stats_store['web_ok']}</code> | Запаска <code>{stats_store['fallback_ok']}</code>\n",
     ]
     if stats_store.get("last_err"):
-        lines.append(f"⚠️ Последний сбой веба: <code>{html.escape(stats_store['last_err'][:120])}</code>\n")
+        lines.append(f"⚠️ Последний сбой веба: <code>{html.escape(stats_store['last_err'][:150])}</code>\n")
     now = time.time()
     active_count = 0
     for uid_str, info in list(users.items()):
@@ -845,13 +768,17 @@ def create_dispatcher(bot_inst: Bot):
         r_label = dict((v, k) for k, v in REASONING_LIST).get(prefs["reasoning"], prefs["reasoning"])
         await message.answer(f"Модель: <b>{prefs['model_label']}</b>\nУровень рассуждений: <b>{r_label}</b>", parse_mode="HTML", reply_markup=get_main_reply_kb(uid, uname))
 
-    # Просмотр лимитов для любого пользователя (без полосок, только проценты!)
     @d.message(F.text == "📊 Лимиты")
     async def user_limits_cmd(message: types.Message):
         uid, uname = message.from_user.id, message.from_user.username
         if not check_access(message.from_user):
             await message.answer("🔒 Доступ закрыт.", reply_markup=get_locked_kb())
             return
+        try:
+            client = await get_web_client()
+            await refresh_live_quotas(client)
+        except Exception:
+            pass
         await message.answer(format_limits_clean(uid), parse_mode="HTML", reply_markup=get_main_reply_kb(uid, uname))
 
     @d.callback_query(F.data == "req_access")
@@ -1092,7 +1019,7 @@ def create_dispatcher(bot_inst: Bot):
         kb.button(text="🔙 Назад", callback_data="adm_back")
         try:
             await get_web_client(force_reinit=True)
-            await call.message.edit_text("✅ <b>Веб-сессия Gemini Pro переподключена!</b>", parse_mode="HTML", reply_markup=kb.as_markup())
+            await call.message.edit_text("✅ <b>Веб-сессия Gemini Pro переподключена, все старые чаты сброшены!</b>", parse_mode="HTML", reply_markup=kb.as_markup())
         except Exception as e:
             await call.message.edit_text(f"⚠️ Ошибка: <code>{html.escape(str(e))}</code>", parse_mode="HTML", reply_markup=kb.as_markup())
 
@@ -1239,7 +1166,7 @@ def create_dispatcher(bot_inst: Bot):
                 save_access_db(access_db)
                 try:
                     await get_web_client(force_reinit=True)
-                    await message.answer("✅ <b>Новые куки сохранены и подключены!</b>", parse_mode="HTML", reply_markup=get_main_reply_kb(uid, uname))
+                    await message.answer("✅ <b>Новые куки сохранены, старые сессии сброшены, вход в Pro выполнен!</b>", parse_mode="HTML", reply_markup=get_main_reply_kb(uid, uname))
                 except Exception as e:
                     await message.answer(f"⚠️ Ошибка куков: <code>{html.escape(str(e))}</code>", parse_mode="HTML")
                 return
@@ -1248,16 +1175,16 @@ def create_dispatcher(bot_inst: Bot):
             try:
                 await ask_gemini_web(bot_inst, message, message.text)
             except Exception as web_err:
-                stats_store["last_err"] = f"{type(web_err).__name__}: {web_err}"
-                prefs = get_prefs(uid)
-                if is_image_intent(message.text, prefs["tool"]):
-                    if await generate_guaranteed_image(message, message.text):
-                        return
+                err_name = f"{type(web_err).__name__}: {web_err}".strip(": ")
+                stats_store["last_err"] = err_name
                 try:
-                    ans, _ = await ask_gemini_fallback(uid, message.text, message.text)
-                    # Пользователи видят ТОЛЬКО чистый ответ без надписей про Запасной API!
-                    await safe_send(message, ans)
-                except Exception as e:
+                    ans, used_model = await ask_gemini_fallback(uid, message.text, message.text)
+                    # Админ видит причину сбоя веба, а обычные юзеры видят ТОЛЬКО чистый ответ!
+                    if is_admin(uid, uname):
+                        await safe_send(message, f"⚠️ [Админ-инфо: Запасной API ({used_model}) | Веб: {err_name}]\n\n{ans}")
+                    else:
+                        await safe_send(message, ans)
+                except Exception:
                     await message.answer("⏳ Сервер обрабатывает запросы, попробуй ещё раз через пару секунд.", reply_markup=get_main_reply_kb(uid, uname))
 
     @d.message(F.photo)
@@ -1278,11 +1205,15 @@ def create_dispatcher(bot_inst: Bot):
                 try:
                     await ask_gemini_web(bot_inst, message, caption, file_path=temp_path)
                 except Exception as web_err:
-                    stats_store["last_err"] = f"{type(web_err).__name__}: {web_err}"
+                    err_name = f"{type(web_err).__name__}: {web_err}".strip(": ")
+                    stats_store["last_err"] = err_name
                     image = Image.open(file_io)
                     image.load()
-                    ans, _ = await ask_gemini_fallback(uid, [caption, image], f"[Фото] {caption}")
-                    await safe_send(message, ans)
+                    ans, used_model = await ask_gemini_fallback(uid, [caption, image], f"[Фото] {caption}")
+                    if is_admin(uid, uname):
+                        await safe_send(message, f"⚠️ [Админ-инфо: Запасной API ({used_model}) | Веб: {err_name}]\n\n{ans}")
+                    else:
+                        await safe_send(message, ans)
             except Exception:
                 await message.answer("⏳ Не удалось обработать фото, попробуй ещё раз.", reply_markup=get_main_reply_kb(uid, uname))
             finally:
@@ -1310,7 +1241,7 @@ def create_dispatcher(bot_inst: Bot):
     return d
 
 @st.cache_resource
-def launch_bot_v42():
+def launch_bot_v44():
     gen_id = time.time()
     sys._active_tg_gen = gen_id
     old_state = getattr(sys, "_active_tg_bot", None)
@@ -1342,7 +1273,7 @@ def launch_bot_v42():
     t.start()
     return t
 
-launch_bot_v42()
+launch_bot_v44()
 
 st.title("Gemini Bot")
 st.success("Активен (@targetturtle)")

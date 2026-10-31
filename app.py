@@ -1,14 +1,4 @@
-import os
-import sys
-import io
-import re
-import html
-import json
-import time
-import shutil
-import subprocess
-import asyncio
-import threading
+import os, sys, io, re, html, json, time, shutil, subprocess, asyncio, threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from PIL import Image
@@ -24,7 +14,6 @@ import gemini_webapi.client as _gw_client
 
 HAS_PPTX = False
 try:
-    import pptx
     from pptx import Presentation
     from pptx.util import Inches, Pt
     from pptx.dml.color import RGBColor
@@ -32,7 +21,6 @@ try:
 except ImportError:
     try:
         subprocess.check_call([sys.executable, "-m", "pip", "install", "--target", TMP_PKGS, "python-pptx"])
-        import pptx
         from pptx import Presentation
         from pptx.util import Inches, Pt
         from pptx.dml.color import RGBColor
@@ -43,14 +31,11 @@ except ImportError:
 try:
     from curl_cffi import CurlHttpVersion
     from curl_cffi.requests import AsyncSession
-
     if not getattr(AsyncSession, "_http2_patched", False):
         _orig_init = AsyncSession.__init__
-
         def _http2_init(self, *args, **kwargs):
             kwargs["http_version"] = CurlHttpVersion.V2_0
             _orig_init(self, *args, **kwargs)
-
         AsyncSession.__init__ = _http2_init
         AsyncSession._http2_patched = True
 except Exception:
@@ -87,10 +72,7 @@ def make_available_model(code: str, reasoning_code: str = "low") -> AvailableMod
     d_name, m_name, m_hash, t_id = FULL_MODELS_CATALOG.get(code.lower(), FULL_MODELS_CATALOG["flash"])
     r_slot = 1 if reasoning_code == "low" else 2
     hdr = {
-        "x-goog-ext-525001261-jspb": (
-            f'[1,null,null,null,"{m_hash}",null,null,0,'
-            f'[4,5,6,8],null,null,{r_slot}, null,null,{t_id}]'
-        ),
+        "x-goog-ext-525001261-jspb": f'[1,null,null,null,"{m_hash}",null,null,0,[4,5,6,8],null,null,{r_slot}, null,null,{t_id}]',
         "x-goog-ext-73010989-jspb": "[0]",
         "x-goog-ext-73010990-jspb": "[0,0,0]",
     }
@@ -109,15 +91,9 @@ def load_access_db():
         except Exception:
             pass
     return {
-        "admin_id": None,
-        "admins": [],
-        "admin_usernames": [OWNER_USERNAME],
-        "users": {},
-        "preapproved_usernames": {},
-        "open_mode": False,
-        "custom_psid": "",
-        "custom_psidts": "",
-        "user_cids": {},
+        "admin_id": None, "admins": [], "admin_usernames": [OWNER_USERNAME],
+        "users": {}, "preapproved_usernames": {}, "open_mode": False,
+        "custom_psid": "", "custom_psidts": "", "user_cids": {},
     }
 
 def save_access_db(db):
@@ -128,9 +104,8 @@ def save_access_db(db):
         pass
 
 access_db = load_access_db()
-# Живые квоты храним только в оперативной памяти (без старого кэша из файла!)
 live_quotas = {}
-abuse_status_store = "Не проверено"
+abuse_status_store = "✅ Чистый (Clean)"
 stats_store = {"web_ok": 0, "fallback_ok": 0, "user_reqs": {}}
 admin_input_state = {}
 pending_grant_target = {}
@@ -158,49 +133,20 @@ def _loguru_quota_sink(message):
         model_label = info.split("[")[0].strip() or "Gemini Pro"
         m_frac = re.search(r"(\d+)\s*/\s*(\d+)", info)
         if m_frac:
-            rem = int(m_frac.group(1))
-            tot = int(m_frac.group(2))
+            rem, tot = int(m_frac.group(1)), int(m_frac.group(2))
             if tot > 0:
                 used_pct = max(0, min(100, round((1 - (rem / tot)) * 100)))
-                live_quotas[model_label] = {
-                    "rem": rem,
-                    "tot": tot,
-                    "pct": used_pct,
-                    "reset": parse_utc_reset_to_msk(info),
-                }
+                live_quotas[model_label] = {"rem": rem, "tot": tot, "pct": used_pct, "reset": parse_utc_reset_to_msk(info)}
     elif "Account abuse status:" in text:
         raw_ab = text.split("Account abuse status:", 1)[1].strip()
         abuse_status_store = "✅ Чистый (Clean)" if "Clean" in raw_ab else raw_ab
 
-if hasattr(_gw_client, "logger") and not getattr(_gw_client, "_sink_attached_v39", False):
+if hasattr(_gw_client, "logger") and not getattr(_gw_client, "_sink_v40", False):
     try:
         _gw_client.logger.add(_loguru_quota_sink)
-        _gw_client._sink_attached_v39 = True
+        _gw_client._sink_v40 = True
     except Exception:
         pass
-
-def parse_custom_duration(text: str) -> tuple[int, str]:
-    s = text.lower().strip()
-    if s in ("0", "навсегда", "бессрочно", "forever", "inf"):
-        return 0, "навсегда"
-
-    total_seconds = 0
-    for m in re.finditer(r"(\d+)\s*(?:дн|ден|дня|дней|сут|д\b|d\b)", s):
-        total_seconds += int(m.group(1)) * 86400
-    for m in re.finditer(r"(\d+)\s*(?:час|часа|часов|ч\b|h\b)", s):
-        total_seconds += int(m.group(1)) * 3600
-    for m in re.finditer(r"(\d+)\s*(?:мин|минута|минуты|минут|м\b|m\b)", s):
-        total_seconds += int(m.group(1)) * 60
-    for m in re.finditer(r"(\d+)\s*(?:сек|секунд|с\b|s\b)", s):
-        total_seconds += int(m.group(1))
-
-    if total_seconds == 0 and s.isdigit():
-        total_seconds = int(s) * 60
-
-    if total_seconds <= 0:
-        return -1, ""
-
-    return total_seconds, format_duration_text(total_seconds)
 
 def format_duration_text(seconds: int) -> str:
     if seconds == 0:
@@ -208,23 +154,31 @@ def format_duration_text(seconds: int) -> str:
     if seconds < 0:
         return "истекло"
     total_mins = max(1, int(seconds // 60))
-    days = total_mins // 1440
-    rem_mins = total_mins % 1440
-    hours = rem_mins // 60
-    mins = rem_mins % 60
-
-    if days > 0 and total_mins < 4320 and hours + days * 24 <= 72:
+    days, rem_mins = total_mins // 1440, total_mins % 1440
+    hours, mins = rem_mins // 60, rem_mins % 60
+    if days > 0 and total_mins <= 4320:
         hours += days * 24
         days = 0
-
     parts = []
-    if days > 0:
-        parts.append(f"{days} дн.")
-    if hours > 0:
-        parts.append(f"{hours} ч.")
-    if mins > 0:
-        parts.append(f"{mins} мин.")
+    if days > 0: parts.append(f"{days} дн.")
+    if hours > 0: parts.append(f"{hours} ч.")
+    if mins > 0: parts.append(f"{mins} мин.")
     return " ".join(parts) if parts else "1 мин."
+
+def parse_custom_duration(text: str) -> tuple[int, str]:
+    s = text.lower().strip()
+    if s in ("0", "навсегда", "бессрочно", "forever", "inf"):
+        return 0, "навсегда"
+    total_seconds = 0
+    for m in re.finditer(r"(\d+)\s*(?:дн|ден|дня|дней|сут|д\b|d\b)", s): total_seconds += int(m.group(1)) * 86400
+    for m in re.finditer(r"(\d+)\s*(?:час|часа|часов|ч\b|h\b)", s): total_seconds += int(m.group(1)) * 3600
+    for m in re.finditer(r"(\d+)\s*(?:мин|минута|минуты|минут|м\b|m\b)", s): total_seconds += int(m.group(1)) * 60
+    for m in re.finditer(r"(\d+)\s*(?:сек|секунд|с\b|s\b)", s): total_seconds += int(m.group(1))
+    if total_seconds == 0 and s.isdigit():
+        total_seconds = int(s) * 60
+    if total_seconds <= 0:
+        return -1, ""
+    return total_seconds, format_duration_text(total_seconds)
 
 def build_duration_picker_kb(target_key: str):
     kb = InlineKeyboardBuilder()
@@ -244,35 +198,27 @@ async def refresh_live_quotas(client) -> bool:
             await client._fetch_quota()
         except Exception:
             pass
-
     if not live_quotas:
         rpc_cls = getattr(_gw_client, "RPCData", None)
         if rpc_cls and hasattr(client, "_batch_execute"):
             tz_msk = timezone(timedelta(hours=3))
             months_ru = ["", "янв.", "фев.", "мар.", "апр.", "мая", "июн.", "июл.", "авг.", "сент.", "окт.", "нояб.", "дек."]
             try:
-                response = await client._batch_execute([rpc_cls(rpcid="qp93dd", payload="[]")])
-                if response and response.status_code == 200:
-                    for line in response.text.splitlines():
-                        if "qp93dd" not in line:
-                            continue
+                resp = await client._batch_execute([rpc_cls(rpcid="qp93dd", payload="[]")])
+                if resp and resp.status_code == 200:
+                    for line in resp.text.splitlines():
+                        if "qp93dd" not in line: continue
                         try:
                             outer = json.loads(line)
-                            inner_str = next(
-                                (item[2] for item in outer if isinstance(item, list) and len(item) > 2 and item[1] == "qp93dd" and item[2]),
-                                None,
-                            )
-                            if not inner_str:
-                                continue
+                            inner_str = next((it[2] for it in outer if isinstance(it, list) and len(it) > 2 and it[1] == "qp93dd" and it[2]), None)
+                            if not inner_str: continue
                             data = json.loads(inner_str)
                         except Exception:
                             continue
                         entries = data[0] if isinstance(data, list) and data else None
-                        if not isinstance(entries, list):
-                            continue
+                        if not isinstance(entries, list): continue
                         for entry in entries:
-                            if not isinstance(entry, list) or len(entry) < 3:
-                                continue
+                            if not isinstance(entry, list) or len(entry) < 3: continue
                             rem = entry[1]
                             tot = entry[13] if len(entry) > 13 else None
                             d_name = entry[12] if len(entry) > 12 else "Gemini Pro"
@@ -282,10 +228,7 @@ async def refresh_live_quotas(client) -> bool:
                                 reset_str = ""
                                 if reset_ts:
                                     dt_msk = datetime.fromtimestamp(reset_ts, tz=tz_msk)
-                                    if dt_msk.date() != datetime.now(tz_msk).date():
-                                        reset_str = f"{dt_msk.day} {months_ru[dt_msk.month]} в {dt_msk.strftime('%H:%M')} (МСК)"
-                                    else:
-                                        reset_str = f"в {dt_msk.strftime('%H:%M')} (МСК)"
+                                    reset_str = f"{dt_msk.day} {months_ru[dt_msk.month]} в {dt_msk.strftime('%H:%M')} (МСК)" if dt_msk.date() != datetime.now(tz_msk).date() else f"в {dt_msk.strftime('%H:%M')} (МСК)"
                                 live_quotas[str(d_name)] = {"rem": rem, "tot": tot, "pct": used_pct, "reset": reset_str}
             except Exception:
                 pass
@@ -303,66 +246,44 @@ def inject_missing_models_into_client(client):
 
 def make_progress_bar(pct: int, length: int = 18) -> str:
     filled = round((pct / 100) * length)
-    if pct > 0 and filled == 0:
-        filled = 1
+    if pct > 0 and filled == 0: filled = 1
     filled = min(length, max(0, filled))
     return "█" * filled + "░" * (length - filled)
 
 def format_limits_like_web() -> str:
     if not live_quotas:
-        return "❌ <b>Google не вернул квоты подписки Pro (куки не прошли авторизацию).</b>"
-
+        return "❌ <b>Google не вернул квоты подписки Pro (проверь куки).</b>"
     lines = ["📊 <b>Лимиты на использование</b> <code>PRO</code>\n<i>Реальные данные с сервера Google</i>\n"]
     for m_label, q in live_quotas.items():
-        pct = q["pct"]
-        bar = make_progress_bar(pct)
+        bar = make_progress_bar(q["pct"])
         r_note = f"\n<i>Лимит сбросится {q['reset']}</i>" if q.get("reset") else ""
-        lines.append(
-            f"<b>{html.escape(m_label)}</b> — <b>Использовано {pct} %</b> ({q['rem']}/{q['tot']})\n"
-            f"<code>{bar}</code>{r_note}\n"
-        )
+        lines.append(f"<b>{html.escape(m_label)}</b> — <b>Использовано {q['pct']} %</b> ({q['rem']}/{q['tot']})\n<code>{bar}</code>{r_note}\n")
     return "\n".join(lines)
 
 def markdown_to_telegram_html(text: str) -> str:
-    code_blocks = []
-
-    def _save_code_block(match):
-        code = html.escape(match.group(2).strip())
-        code_blocks.append(f"<pre><code>{code}</code></pre>")
-        return f"@@CODEBLOCK_{len(code_blocks) - 1}@@"
-
-    text = re.sub(r"```([a-zA-Z0-9_-]*)\n?(.*?)```", _save_code_block, text, flags=re.DOTALL)
-
-    inline_codes = []
-
-    def _save_inline_code(match):
-        code = html.escape(match.group(1))
-        inline_codes.append(f"<code>{code}</code>")
-        return f"@@INLINECODE_{len(inline_codes) - 1}@@"
-
-    text = re.sub(r"`([^`\n]+)`", _save_inline_code, text)
-
+    code_blocks, inline_codes = [], []
+    def _save_cb(m):
+        code_blocks.append(f"<pre><code>{html.escape(m.group(2).strip())}</code></pre>")
+        return f"@@CB_{len(code_blocks) - 1}@@"
+    text = re.sub(r"```([a-zA-Z0-9_-]*)\n?(.*?)```", _save_cb, text, flags=re.DOTALL)
+    def _save_ic(m):
+        inline_codes.append(f"<code>{html.escape(m.group(1))}</code>")
+        return f"@@IC_{len(inline_codes) - 1}@@"
+    text = re.sub(r"`([^`\n]+)`", _save_ic, text)
     text = html.escape(text)
     text = re.sub(r"(?m)^\s*#{1,6}\s+(.+?)\s*$", r"<b>\1</b>", text)
     text = re.sub(r"(?m)^\s*[\*\-]\s+", "• ", text)
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text, flags=re.DOTALL)
     text = re.sub(r"\*([^\*\n]+?)\*", r"<i>\1</i>", text)
     text = text.replace("**", "")
-
-    for idx, c_html in enumerate(inline_codes):
-        text = text.replace(f"@@INLINECODE_{idx}@@", c_html)
-    for idx, b_html in enumerate(code_blocks):
-        text = text.replace(f"@@CODEBLOCK_{idx}@@", b_html)
-
+    for idx, c_h in enumerate(inline_codes): text = text.replace(f"@@IC_{idx}@@", c_h)
+    for idx, b_h in enumerate(code_blocks): text = text.replace(f"@@CB_{idx}@@", b_h)
     return text
 
 def sync_user_identity(user: types.User):
-    if not user:
-        return
-    uid = user.id
-    uname = (user.username or "").lower().lstrip("@")
+    if not user: return
+    uid, uname = user.id, (user.username or "").lower().lstrip("@")
     changed = False
-
     admin_unames = [u.lower().lstrip("@") for u in access_db.get("admin_usernames", [OWNER_USERNAME])]
     if uname and (uname == OWNER_USERNAME or uname in admin_unames):
         if access_db.get("admin_id") is None or uname == OWNER_USERNAME:
@@ -371,51 +292,35 @@ def sync_user_identity(user: types.User):
         if uid not in access_db.setdefault("admins", []):
             access_db["admins"].append(uid)
             changed = True
-
     if str(uid) in access_db.get("users", {}) and uname:
         if access_db["users"][str(uid)].get("username") != uname:
             access_db["users"][str(uid)]["username"] = uname
             changed = True
-
     pre = access_db.get("preapproved_usernames", {})
     if uname and uname in pre:
         pre_data = pre.pop(uname)
-        if isinstance(pre_data, dict):
-            dur = pre_data.get("duration", 0)
-            exp_val = (time.time() + dur) if dur > 0 else 0
-        else:
-            exp_val = int(pre_data) if pre_data else 0
+        dur = pre_data.get("duration", 0) if isinstance(pre_data, dict) else int(pre_data or 0)
         access_db.setdefault("users", {})[str(uid)] = {
-            "name": f"{user.full_name} (@{user.username})",
-            "username": uname,
-            "expires_at": exp_val,
+            "name": f"{user.full_name} (@{user.username})", "username": uname,
+            "expires_at": (time.time() + dur) if dur > 0 else 0,
         }
         changed = True
-
-    if changed:
-        save_access_db(access_db)
+    if changed: save_access_db(access_db)
 
 def is_admin(uid: int, username: str = None) -> bool:
     if username and username.lower().lstrip("@") in [u.lower().lstrip("@") for u in access_db.get("admin_usernames", [OWNER_USERNAME])]:
         return True
-    if not uid:
-        return False
-    if access_db.get("admin_id") and int(access_db["admin_id"]) == int(uid):
-        return True
+    if not uid: return False
+    if access_db.get("admin_id") and int(access_db["admin_id"]) == int(uid): return True
     return int(uid) in [int(x) for x in access_db.get("admins", [])]
 
 def check_access(user: types.User) -> bool:
     sync_user_identity(user)
-    if is_admin(user.id, user.username):
-        return True
-    if access_db.get("open_mode", False):
-        return True
+    if is_admin(user.id, user.username) or access_db.get("open_mode", False): return True
     u_info = access_db.get("users", {}).get(str(user.id))
-    if not u_info:
-        return False
+    if not u_info: return False
     exp = u_info.get("expires_at", 0)
-    if exp == 0 or time.time() < exp:
-        return True
+    if exp == 0 or time.time() < exp: return True
     access_db["users"].pop(str(user.id), None)
     save_access_db(access_db)
     return False
@@ -424,65 +329,36 @@ def register_chat_cid(uid: int, *objs):
     cids = access_db.setdefault("user_cids", {}).setdefault(str(uid), [])
     changed = False
     for obj in objs:
-        if obj is None:
-            continue
+        if obj is None: continue
         cid = getattr(obj, "cid", None)
         if not cid and getattr(obj, "metadata", None):
             meta = getattr(obj, "metadata", None)
-            if isinstance(meta, (list, tuple)) and len(meta) > 0:
-                cid = meta[0]
+            if isinstance(meta, (list, tuple)) and len(meta) > 0: cid = meta[0]
         if cid and isinstance(cid, str) and cid not in cids:
             cids.append(cid)
             changed = True
-    if changed:
-        save_access_db(access_db)
+    if changed: save_access_db(access_db)
 
-MODELS_LIST = [
-    ("3.5 Flash-Lite", "flash-lite"),
-    ("3.8 Flash", "flash"),
-    ("3.1 Pro", "pro"),
-    ("4 Argon", "argon"),
-]
-
-REASONING_LIST = [
-    ("Низкий", "low"),
-    ("Средний", "medium"),
-    ("Высокий", "high"),
-]
-
+MODELS_LIST = [("3.5 Flash-Lite", "flash-lite"), ("3.8 Flash", "flash"), ("3.1 Pro", "pro"), ("4 Argon", "argon")]
+REASONING_LIST = [("Низкий", "low"), ("Средний", "medium"), ("Высокий", "high")]
 TOOLS_LIST = [
-    ("Без инструмента", "none"),
-    ("🍌 Создание изображений", "image"),
-    ("🎬 Создание видео", "video"),
-    ("🎵 Создание музыки", "music"),
-    ("📝 Canvas", "canvas"),
-    ("🔬 Deep Research", "deep_research"),
-    ("📖 Обучение", "learning"),
+    ("Без инструмента", "none"), ("🍌 Создание изображений", "image"), ("🎬 Создание видео", "video"),
+    ("🎵 Создание музыки", "music"), ("📝 Canvas", "canvas"), ("🔬 Deep Research", "deep_research"), ("📖 Обучение", "learning"),
 ]
 
 web_client = None
 web_init_lock = asyncio.Lock()
-web_chats = {}
-user_history = {}
-user_prefs = {}
+web_chats, user_history, user_prefs = {}, {}, {}
 working_api_key = None
 
 def get_prefs(uid: int):
     if uid not in user_prefs:
-        user_prefs[uid] = {
-            "model": "flash",
-            "model_label": "3.8 Flash",
-            "reasoning": "low",
-            "tool": "none",
-        }
+        user_prefs[uid] = {"model": "flash", "model_label": "3.8 Flash", "reasoning": "low", "tool": "none"}
     return user_prefs[uid]
 
 def get_main_reply_kb(uid: int = 0, username: str = None):
     kb = ReplyKeyboardBuilder()
-    kb.button(text="Модель")
-    kb.button(text="Уровень рассуждений")
-    kb.button(text="Инструменты")
-    kb.button(text="Новый чат")
+    for t in ["Модель", "Уровень рассуждений", "Инструменты", "Новый чат"]: kb.button(text=t)
     if is_admin(uid, username):
         kb.button(text="👑 Админка")
         kb.adjust(2, 2, 1)
@@ -500,12 +376,11 @@ def get_active_cookies():
     psidts = access_db.get("custom_psidts") or SECURE_1PSIDTS
     return psid.strip() if psid else "", psidts.strip() if psidts else None
 
-# Строгое подключение с обоими куками (БЕЗ сброса psidts в None!)
 async def get_web_client(force_reinit: bool = False):
     global web_client
     psid, psidts = get_active_cookies()
     if not psid:
-        raise Exception("В Secrets не указан SECURE_1PSID")
+        raise Exception("Не указан SECURE_1PSID")
     async with web_init_lock:
         if force_reinit or web_client is None:
             live_quotas.clear()
@@ -520,21 +395,15 @@ async def get_web_client(force_reinit: bool = False):
 
 async def delete_old_web_chat(uid: int):
     old_chat = web_chats.pop(uid, None)
-    if old_chat is not None:
-        register_chat_cid(uid, old_chat)
-
+    if old_chat is not None: register_chat_cid(uid, old_chat)
     saved_cids = list(access_db.get("user_cids", {}).get(str(uid), []))
-    if not saved_cids:
-        return
-
+    if not saved_cids: return
     try:
         client = await get_web_client()
         if hasattr(client, "delete_chat"):
             for cid in saved_cids:
-                try:
-                    await client.delete_chat(cid)
-                except Exception:
-                    pass
+                try: await client.delete_chat(cid)
+                except Exception: pass
         access_db.setdefault("user_cids", {})[str(uid)] = []
         save_access_db(access_db)
     except Exception:
@@ -547,171 +416,69 @@ def resolve_model_clean(client, model_code: str, reasoning_code: str = "low") ->
 @asynccontextmanager
 async def continuous_typing(bot_inst: Bot, chat_id: int, action: str = "typing"):
     stop_event = asyncio.Event()
-
     async def _loop():
         while not stop_event.is_set():
-            try:
-                await bot_inst.send_chat_action(chat_id=chat_id, action=action)
-            except Exception:
-                pass
-            try:
-                await asyncio.wait_for(stop_event.wait(), timeout=4.0)
-            except asyncio.TimeoutError:
-                pass
-
+            try: await bot_inst.send_chat_action(chat_id=chat_id, action=action)
+            except Exception: pass
+            try: await asyncio.wait_for(stop_event.wait(), timeout=4.0)
+            except asyncio.TimeoutError: pass
     task = asyncio.create_task(_loop())
-    try:
-        yield
+    try: yield
     finally:
         stop_event.set()
         task.cancel()
 
 def build_canvas_pptx(slides_data: list) -> bytes:
-    if not HAS_PPTX:
-        return b""
+    if not HAS_PPTX: return b""
     prs = Presentation()
-    prs.slide_width = Inches(13.333)
-    prs.slide_height = Inches(7.5)
+    prs.slide_width, prs.slide_height = Inches(13.333), Inches(7.5)
     blank_layout = prs.slide_layouts[6]
-
     for idx, s in enumerate(slides_data):
         slide = prs.slides.add_slide(blank_layout)
-        bg = slide.background
-        fill = bg.fill
+        fill = slide.background.fill
         fill.solid()
         fill.fore_color.rgb = RGBColor(13, 25, 43)
-
-        tag_text = str(s.get("tag", f"СЛАЙД {idx + 1}")).upper()
-        title_text = str(s.get("title", f"Слайд {idx + 1}"))
-        subtitle_text = str(s.get("subtitle", ""))
-        points = s.get("points", [])
-
         tb_tag = slide.shapes.add_textbox(Inches(1.0), Inches(1.0), Inches(11.3), Inches(0.5))
         p_tag = tb_tag.text_frame.paragraphs[0]
-        p_tag.text = tag_text
-        p_tag.font.size = Pt(11)
-        p_tag.font.bold = True
-        p_tag.font.color.rgb = RGBColor(56, 189, 248)
-
+        p_tag.text = str(s.get("tag", f"СЛАЙД {idx + 1}")).upper()
+        p_tag.font.size, p_tag.font.bold, p_tag.font.color.rgb = Pt(11), True, RGBColor(56, 189, 248)
         tb_title = slide.shapes.add_textbox(Inches(1.0), Inches(1.5), Inches(11.3), Inches(1.6))
-        tf_title = tb_title.text_frame
-        tf_title.word_wrap = True
-        p_title = tf_title.paragraphs[0]
-        p_title.text = title_text
-        p_title.font.size = Pt(34 if idx == 0 else 28)
-        p_title.font.bold = True
-        p_title.font.color.rgb = RGBColor(255, 255, 255)
-
+        tb_title.text_frame.word_wrap = True
+        p_title = tb_title.text_frame.paragraphs[0]
+        p_title.text = str(s.get("title", f"Слайд {idx + 1}"))
+        p_title.font.size, p_title.font.bold, p_title.font.color.rgb = Pt(34 if idx == 0 else 28), True, RGBColor(255, 255, 255)
         tb_body = slide.shapes.add_textbox(Inches(1.0), Inches(3.2), Inches(11.3), Inches(3.6))
         tf_body = tb_body.text_frame
         tf_body.word_wrap = True
-
         first_p = True
-        if subtitle_text:
+        if s.get("subtitle"):
             p = tf_body.paragraphs[0]
             first_p = False
-            p.text = subtitle_text
-            p.font.size = Pt(18)
-            p.font.color.rgb = RGBColor(148, 163, 184)
-            p.space_after = Pt(14)
-
-        for pt in points:
+            p.text, p.font.size, p.font.color.rgb, p.space_after = str(s["subtitle"]), Pt(18), RGBColor(148, 163, 184), Pt(14)
+        for pt in s.get("points", []):
             p = tf_body.paragraphs[0] if first_p else tf_body.add_paragraph()
             first_p = False
-            p.text = f"• {pt}"
-            p.font.size = Pt(18)
-            p.font.color.rgb = RGBColor(226, 232, 240)
-            p.space_after = Pt(10)
-
+            p.text, p.font.size, p.font.color.rgb, p.space_after = f"• {pt}", Pt(18), RGBColor(226, 232, 240), Pt(10)
     out_io = io.BytesIO()
     prs.save(out_io)
     return out_io.getvalue()
 
-def build_canvas_html(slides_data: list) -> bytes:
-    slides_json = json.dumps(slides_data, ensure_ascii=False)
-    html_code = f"""<!DOCTYPE html>
-<html lang="ru">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Презентация Canvas</title>
-<style>
-  body {{ margin:0; background:#090d16; color:#fff; font-family:system-ui,-apple-system,sans-serif; display:flex; flex-direction:column; align-items:center; justify-content:center; min-height:100vh; }}
-  .nav {{ display:flex; align-items:center; gap:16px; background:#1e293b; padding:8px 20px; border-radius:99px; margin-bottom:20px; }}
-  .nav button {{ background:none; border:none; color:#fff; font-size:18px; cursor:pointer; padding:4px 10px; }}
-  .card {{ width:90%; max-width:900px; min-height:460px; background:linear-gradient(135deg,#0d1b2a,#1b263b); border-radius:20px; padding:48px; box-sizing:border-box; box-shadow:0 20px 50px rgba(0,0,0,0.6); display:flex; flex-direction:column; justify-content:center; }}
-  .tag {{ color:#38bdf8; font-size:13px; font-weight:700; letter-spacing:1.5px; text-transform:uppercase; margin-bottom:14px; }}
-  .title {{ font-size:36px; font-weight:800; margin:0 0 18px 0; line-height:1.2; font-family:Georgia,serif; }}
-  .sub {{ color:#94a3b8; font-size:18px; margin-bottom:22px; line-height:1.5; }}
-  .line {{ width:50px; height:4px; background:#38bdf8; margin-bottom:24px; border-radius:2px; }}
-  ul {{ margin:0; padding-left:22px; color:#e2e8f0; font-size:18px; line-height:1.7; }}
-  li {{ margin-bottom:10px; }}
-</style>
-</head>
-<body>
-  <div class="nav">
-    <button onclick="prev()">❮</button>
-    <span id="counter">1 / 1</span>
-    <button onclick="next()">❯</button>
-  </div>
-  <div class="card">
-    <div class="tag" id="s_tag"></div>
-    <h1 class="title" id="s_title"></h1>
-    <div class="sub" id="s_sub"></div>
-    <div class="line"></div>
-    <ul id="s_list"></ul>
-  </div>
-<script>
-const slides = {slides_json};
-let cur = 0;
-function render() {{
-  const s = slides[cur] || {{}};
-  document.getElementById('counter').innerText = (cur + 1) + ' of ' + slides.length;
-  document.getElementById('s_tag').innerText = s.tag || ('СЛАЙД ' + (cur + 1));
-  document.getElementById('s_title').innerText = s.title || '';
-  document.getElementById('s_sub').innerText = s.subtitle || '';
-  const ul = document.getElementById('s_list');
-  ul.innerHTML = '';
-  (s.points || []).forEach(p => {{
-    const li = document.createElement('li');
-    li.innerText = p;
-    ul.appendChild(li);
-  }});
-}}
-function prev() {{ if (cur > 0) {{ cur--; render(); }} }}
-function next() {{ if (cur < slides.length - 1) {{ cur++; render(); }} }}
-document.addEventListener('keydown', e => {{ if (e.key === 'ArrowRight') next(); if (e.key === 'ArrowLeft') prev(); }});
-render();
-</script>
-</body>
-</html>"""
-    return html_code.encode("utf-8")
-
 async def safe_send(message: types.Message, text: str):
-    if not text:
-        return
-    uid = message.from_user.id
-    uname = message.from_user.username
-
+    if not text: return
+    uid, uname = message.from_user.id, message.from_user.username
     text = re.sub(r"https?://googleusercontent\.com/\S+", "", text)
     text = re.sub(r"(?:^|\s)_[0-9]+\b", "", text).strip()
-    if not text:
-        return
-
+    if not text: return
     if "SEND_FILE:" in text:
         after_tag = text.split("SEND_FILE:", 1)[1].strip()
         lines = after_tag.split("\n", 1)
         filename = lines[0].strip() or "file.py"
-        file_content = lines[1] if len(lines) > 1 else ""
-        file_content = re.sub(r"^```[a-zA-Z0-9_-]*\n", "", file_content.strip())
-        file_content = re.sub(r"\n```$", "", file_content.strip())
+        file_content = re.sub(r"^```[a-zA-Z0-9_-]*\n|\n```$", "", (lines[1] if len(lines) > 1 else "").strip())
         doc = types.BufferedInputFile(file_content.encode("utf-8"), filename=filename)
         await message.answer_document(doc, reply_markup=get_main_reply_kb(uid, uname))
         return
-
-    max_len = 3800
-    for i in range(0, len(text), max_len):
-        raw_part = text[i:i + max_len]
+    for i in range(0, len(text), 3800):
+        raw_part = text[i:i + 3800]
         html_part = markdown_to_telegram_html(raw_part)
         try:
             await message.answer(html_part, parse_mode="HTML", reply_markup=get_main_reply_kb(uid, uname))
@@ -720,27 +487,18 @@ async def safe_send(message: types.Message, text: str):
             await message.answer(clean_plain, parse_mode=None, reply_markup=get_main_reply_kb(uid, uname))
 
 def is_presentation_request(prompt: str, resp_text: str) -> bool:
-    p_low = prompt.lower()
-    r_low = (resp_text or "").lower()
-    keywords = ["презентац", "повер поинт", "павер поинт", "powerpoint", "pptx", "слайд"]
-    if any(k in p_low for k in keywords):
-        return True
-    if ("презентац" in r_low or "presentation" in r_low) and ("готов" in r_low or "посмотреть" in r_low or "i will now generate" in r_low):
-        return True
-    return False
+    p_low, r_low = prompt.lower(), (resp_text or "").lower()
+    if any(k in p_low for k in ["презентац", "повер поинт", "павер поинт", "powerpoint", "pptx", "слайд"]): return True
+    return ("презентац" in r_low or "presentation" in r_low) and ("готов" in r_low or "посмотреть" in r_low or "i will now generate" in r_low)
 
 def is_canvas_stub(resp_text: str) -> bool:
-    if not resp_text:
-        return False
+    if not resp_text: return False
     r_low = resp_text.lower()
-    stubs = ["i will now generate", "вы можете посмотреть её", "вы можете посмотреть его", "готова! вы можете", "готов! вы можете"]
-    return len(resp_text) < 600 and any(s in r_low for s in stubs)
+    return len(resp_text) < 600 and any(s in r_low for s in ["i will now generate", "вы можете посмотреть её", "вы можете посмотреть его", "готова! вы можете", "готов! вы можете"])
 
 async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, file_path: str = None):
-    uid = message.from_user.id
-    uname = message.from_user.username
+    uid, uname = message.from_user.id, message.from_user.username
     prefs = get_prefs(uid)
-
     files = [file_path] if file_path else None
     client = await get_web_client()
     target_model = resolve_model_clean(client, prefs["model"], prefs["reasoning"])
@@ -755,11 +513,9 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
     register_chat_cid(uid, chat, response)
 
     resp_text = getattr(response, "text", "") or ""
-
     stats_store["web_ok"] += 1
     stats_store["user_reqs"][str(uid)] = stats_store["user_reqs"].get(str(uid), 0) + 1
 
-    # Отправка ТОЛЬКО настоящих картинок из ответа Gemini Web (без сторонних генераторов!)
     if getattr(response, "images", None):
         for idx, img in enumerate(response.images):
             try:
@@ -768,103 +524,66 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
                 await img.save(path="/tmp", filename=out_name)
                 if os.path.exists(out_path):
                     with open(out_path, "rb") as f:
-                        photo_file = types.BufferedInputFile(f.read(), filename=out_name)
-                        await message.answer_photo(photo_file, reply_markup=get_main_reply_kb(uid, uname))
+                        await message.answer_photo(types.BufferedInputFile(f.read(), filename=out_name), reply_markup=get_main_reply_kb(uid, uname))
                     os.remove(out_path)
                 elif getattr(img, "url", None):
                     await message.answer_photo(img.url, reply_markup=get_main_reply_kb(uid, uname))
             except Exception:
                 if getattr(img, "url", None):
-                    try:
-                        await message.answer_photo(img.url, reply_markup=get_main_reply_kb(uid, uname))
-                    except Exception:
-                        pass
+                    try: await message.answer_photo(img.url, reply_markup=get_main_reply_kb(uid, uname))
+                    except Exception: pass
 
     if getattr(response, "videos", None):
         vid_dir = f"/tmp/vid_{uid}_{int(time.time())}"
         os.makedirs(vid_dir, exist_ok=True)
         try:
-            for vid in response.videos:
-                await vid.save(path=vid_dir, verbose=True)
+            for vid in response.videos: await vid.save(path=vid_dir, verbose=True)
             for fname in sorted(os.listdir(vid_dir)):
                 fpath = os.path.join(vid_dir, fname)
                 if os.path.isfile(fpath):
                     with open(fpath, "rb") as f:
-                        vid_doc = types.BufferedInputFile(f.read(), filename=fname if fname.endswith(".mp4") else f"{fname}.mp4")
-                        await message.answer_video(vid_doc, caption="🎬 <b>Видео готово!</b>", parse_mode="HTML", reply_markup=get_main_reply_kb(uid, uname))
-        except Exception as e:
-            print(f"[!] Ошибка сохранения видео: {e}")
-        finally:
-            shutil.rmtree(vid_dir, ignore_errors=True)
+                        await message.answer_video(types.BufferedInputFile(f.read(), filename=fname if fname.endswith(".mp4") else f"{fname}.mp4"), caption="🎬 <b>Видео готово!</b>", parse_mode="HTML", reply_markup=get_main_reply_kb(uid, uname))
+        except Exception: pass
+        finally: shutil.rmtree(vid_dir, ignore_errors=True)
 
     if getattr(response, "media", None):
         med_dir = f"/tmp/med_{uid}_{int(time.time())}"
         os.makedirs(med_dir, exist_ok=True)
         try:
-            for med in response.media:
-                await med.save(path=med_dir, verbose=True)
+            for med in response.media: await med.save(path=med_dir, verbose=True)
             for fname in sorted(os.listdir(med_dir)):
                 fpath = os.path.join(med_dir, fname)
                 if os.path.isfile(fpath):
-                    with open(fpath, "rb") as f:
-                        raw_b = f.read()
+                    with open(fpath, "rb") as f: raw_b = f.read()
                     if fname.lower().endswith((".mp3", ".wav", ".ogg", ".m4a")):
-                        aud_doc = types.BufferedInputFile(raw_b, filename=fname)
-                        await message.answer_audio(aud_doc, caption="🎵 <b>Музыкальный трек готов!</b>", parse_mode="HTML", reply_markup=get_main_reply_kb(uid, uname))
+                        await message.answer_audio(types.BufferedInputFile(raw_b, filename=fname), caption="🎵 <b>Музыкальный трек готов!</b>", parse_mode="HTML", reply_markup=get_main_reply_kb(uid, uname))
                     elif fname.lower().endswith(".mp4"):
-                        vid_doc = types.BufferedInputFile(raw_b, filename=fname)
-                        await message.answer_video(vid_doc, caption="🎬 <b>Видео-обложка трека</b>", parse_mode="HTML", reply_markup=get_main_reply_kb(uid, uname))
-                    else:
-                        doc_f = types.BufferedInputFile(raw_b, filename=fname)
-                        await message.answer_document(doc_f, reply_markup=get_main_reply_kb(uid, uname))
-        except Exception as e:
-            print(f"[!] Ошибка сохранения аудио: {e}")
-        finally:
-            shutil.rmtree(med_dir, ignore_errors=True)
+                        await message.answer_video(types.BufferedInputFile(raw_b, filename=fname), caption="🎬 <b>Видео-обложка трека</b>", parse_mode="HTML", reply_markup=get_main_reply_kb(uid, uname))
+        except Exception: pass
+        finally: shutil.rmtree(med_dir, ignore_errors=True)
 
     if is_presentation_request(prompt, resp_text):
         try:
             extract_prompt = (
                 "Не используй Canvas. Выведи все слайды этой презентации СТРОГО в формате чистого JSON-массива "
-                "(без кавычек ```json и без лишнего текста до и после): "
-                '[{"tag": "ТЕМА РАЗДЕЛА", "title": "Заголовок слайда", "subtitle": "Подзаголовок или краткая суть", "points": ["Пункт 1", "Пункт 2", "Пункт 3"]}]'
+                "(без кавычек ```json и без лишнего текста): "
+                '[{"tag": "РАЗДЕЛ", "title": "Заголовок", "subtitle": "Подзаголовок", "points": ["Пункт 1", "Пункт 2"]}]'
             )
             slide_resp = await asyncio.wait_for(chat.send_message(extract_prompt), timeout=90)
-            raw_json = (slide_resp.text or "").strip()
-            m_json = re.search(r"\[.*\]", raw_json, flags=re.DOTALL)
+            m_json = re.search(r"\[.*\]", (slide_resp.text or "").strip(), flags=re.DOTALL)
             if m_json:
                 slides_data = json.loads(m_json.group(0))
-                if isinstance(slides_data, list) and len(slides_data) > 0:
+                if isinstance(slides_data, list) and slides_data:
                     pptx_bytes = build_canvas_pptx(slides_data)
-                    html_bytes = build_canvas_html(slides_data)
-
                     if pptx_bytes:
-                        pptx_doc = types.BufferedInputFile(pptx_bytes, filename="Presentation.pptx")
-                        await message.answer_document(
-                            pptx_doc,
-                            caption="📊 <b>Презентация PowerPoint (.pptx) готова!</b>",
-                            parse_mode="HTML",
-                            reply_markup=get_main_reply_kb(uid, uname)
-                        )
-                    html_doc = types.BufferedInputFile(html_bytes, filename="Presentation_Canvas.html")
-                    await message.answer_document(
-                        html_doc,
-                        caption="🌐 <b>Интерактивная версия (листается в браузере как в Canvas)</b>",
-                        parse_mode="HTML",
-                        reply_markup=get_main_reply_kb(uid, uname)
-                    )
-                    return
-        except Exception as e:
-            print(f"[!] Ошибка сборки презентации: {e}")
-
+                        await message.answer_document(types.BufferedInputFile(pptx_bytes, filename="Presentation.pptx"), caption="📊 <b>Презентация PowerPoint (.pptx) готова!</b>", parse_mode="HTML", reply_markup=get_main_reply_kb(uid, uname))
+                        return
+        except Exception:
+            pass
     elif is_canvas_stub(resp_text) and not getattr(response, "videos", None) and not getattr(response, "media", None):
         try:
-            extract_doc = await asyncio.wait_for(
-                chat.send_message("Не открывай Canvas. Выведи полное содержимое только что созданного документа/кода обычным текстом прямо сюда в сообщение."),
-                timeout=90
-            )
-            if getattr(extract_doc, "text", None):
-                resp_text = extract_doc.text
+            extract_doc = await asyncio.wait_for(chat.send_message("Не открывай Canvas. Выведи полное содержимое документа/кода обычным текстом прямо сюда в чат."), timeout=90)
+            if getattr(extract_doc, "text", None): resp_text = extract_doc.text
         except Exception:
             pass
 
@@ -876,53 +595,35 @@ async def ask_gemini_fallback(user_id: int, new_content, history_text: str):
     tz_msk = timezone(timedelta(hours=3))
     current_time = datetime.now(tz_msk).strftime("%d.%m.%Y, %H:%M")
     prefs = get_prefs(user_id)
-
-    api_models = ["gemini-3.8-flash", "gemini-3.5-flash-lite"]
     keys_to_try = ([working_api_key] + [k for k in GEMINI_KEYS if k != working_api_key]) if working_api_key else GEMINI_KEYS
-
     last_err = None
-    for model_name in api_models:
+    for model_name in ["gemini-3.8-flash", "gemini-3.5-flash-lite"]:
         for key in keys_to_try:
-            if not key:
-                continue
+            if not key: continue
             try:
                 client = genai.Client(api_key=key.strip())
                 response = await asyncio.to_thread(
-                    client.models.generate_content,
-                    model=model_name,
-                    contents=[new_content],
-                    config=gtypes.GenerateContentConfig(
-                        system_instruction=(
-                            f"Сейчас (МСК): {current_time}. Твоя модель: Gemini {prefs['model_label']}. "
-                            "Отвечай чётко по сути запроса пользователя. Пиши математику без $ и без LaTeX (x², √, /). "
-                            "Если просят скинуть файлом — начни первую строку с SEND_FILE:имя_файла.расширение"
-                        )
-                    ),
+                    client.models.generate_content, model=model_name, contents=[new_content],
+                    config=gtypes.GenerateContentConfig(system_instruction=f"Сейчас (МСК): {current_time}. Модель: {prefs['model_label']}. Пиши математику без $ и без LaTeX."),
                 )
                 working_api_key = key
                 stats_store["fallback_ok"] += 1
                 stats_store["user_reqs"][str(user_id)] = stats_store["user_reqs"].get(str(user_id), 0) + 1
-                ans = response.text or "Пустой ответ."
-                return ans, model_name
+                return (response.text or "Пустой ответ."), model_name
             except Exception as e:
                 last_err = e
-                continue
     raise Exception(f"Запасные ключи не сработали: {last_err}")
 
 async def apply_user_grant(bot_inst: Bot, target_key: str, seconds: int) -> str:
     clean_key = target_key.lstrip("@").lower().strip()
     expires_at = (time.time() + seconds) if seconds > 0 else 0
     period_str = format_duration_text(seconds)
-
-    matched_uid_str = None
-    if clean_key.isdigit():
-        matched_uid_str = clean_key
-    else:
+    matched_uid_str = clean_key if clean_key.isdigit() else None
+    if not matched_uid_str:
         for u_id, info in access_db.get("users", {}).items():
             if info.get("username", "").lower() == clean_key or f"@{clean_key}" in info.get("name", "").lower():
                 matched_uid_str = u_id
                 break
-
     if matched_uid_str:
         target_uid = int(matched_uid_str)
         try:
@@ -931,69 +632,37 @@ async def apply_user_grant(bot_inst: Bot, target_key: str, seconds: int) -> str:
             uname_val = (chat_info.username or "").lower()
         except Exception:
             old_info = access_db.get("users", {}).get(matched_uid_str, {})
-            name_label = old_info.get("name", f"ID {matched_uid_str}")
-            uname_val = old_info.get("username", clean_key)
-
-        access_db.setdefault("users", {})[matched_uid_str] = {
-            "name": name_label,
-            "username": uname_val,
-            "expires_at": expires_at,
-        }
+            name_label, uname_val = old_info.get("name", f"ID {matched_uid_str}"), old_info.get("username", clean_key)
+        access_db.setdefault("users", {})[matched_uid_str] = {"name": name_label, "username": uname_val, "expires_at": expires_at}
         access_db.get("preapproved_usernames", {}).pop(clean_key, None)
         save_access_db(access_db)
-
         try:
-            await bot_inst.send_message(
-                target_uid,
-                f"🎉 <b>Тебе открыт доступ к боту!</b>\n⏳ Срок: <b>{period_str}</b>\nМожешь писать вопросы или скидывать фото задач 👇",
-                parse_mode="HTML",
-                reply_markup=get_main_reply_kb(target_uid, uname_val)
-            )
-        except Exception:
-            pass
+            await bot_inst.send_message(target_uid, f"🎉 <b>Тебе открыт доступ к боту!</b>\n⏳ Срок: <b>{period_str}</b>", parse_mode="HTML", reply_markup=get_main_reply_kb(target_uid, uname_val))
+        except Exception: pass
         return f"✅ Доступ для <b>{html.escape(name_label)}</b> открыт на срок: <b>{period_str}</b>!"
-    else:
-        access_db.setdefault("preapproved_usernames", {})[clean_key] = {
-            "duration": seconds,
-            "added_at": time.time(),
-        }
-        save_access_db(access_db)
-        return f"✅ Доступ для <b>@{html.escape(clean_key)}</b> сохранён на срок: <b>{period_str}</b> (активируется сразу при его входе в бота)!"
+    access_db.setdefault("preapproved_usernames", {})[clean_key] = {"duration": seconds, "added_at": time.time()}
+    save_access_db(access_db)
+    return f"✅ Доступ для <b>@{html.escape(clean_key)}</b> сохранён на срок: <b>{period_str}</b>!"
 
 async def revoke_user_by_key(bot_inst: Bot, target_key: str) -> str:
     clean_key = target_key.lstrip("@").lower().strip()
     removed_names = []
-
     if clean_key in access_db.get("preapproved_usernames", {}):
         access_db["preapproved_usernames"].pop(clean_key, None)
         removed_names.append(f"@{clean_key}")
-
     for uid_str, info in list(access_db.get("users", {}).items()):
-        u_nick = info.get("username", "").lower()
-        u_full = info.get("name", "").lower()
-        if uid_str == clean_key or u_nick == clean_key or f"@{clean_key}" in u_full:
+        if uid_str == clean_key or info.get("username", "").lower() == clean_key or f"@{clean_key}" in info.get("name", "").lower():
             access_db["users"].pop(uid_str, None)
             removed_names.append(info.get("name", uid_str))
             await delete_old_web_chat(int(uid_str))
-            try:
-                await bot_inst.send_message(
-                    int(uid_str),
-                    "🔒 Твой доступ к боту завершён.",
-                    reply_markup=types.ReplyKeyboardRemove()
-                )
-            except Exception:
-                pass
-
+            try: await bot_inst.send_message(int(uid_str), "🔒 Твой доступ к боту завершён.", reply_markup=types.ReplyKeyboardRemove())
+            except Exception: pass
     save_access_db(access_db)
-    if removed_names:
-        return f"🔒 Доступ удалён у: <b>{html.escape(', '.join(removed_names))}</b>"
-    return f"⚠️ Пользователь <code>{html.escape(target_key)}</code> не найден в списке активных."
+    return f"🔒 Доступ удалён у: <b>{html.escape(', '.join(removed_names))}</b>" if removed_names else f"⚠️ Пользователь <code>{html.escape(target_key)}</code> не найден."
 
 def build_admin_panel_view():
     users = access_db.get("users", {})
-    open_mode = access_db.get("open_mode", False)
-    mode_str = "🔓 ОТКРЫТ ДЛЯ ВСЕХ" if open_mode else "🔒 ЗАКРЫТЫЙ (По заявкам)"
-
+    mode_str = "🔓 ОТКРЫТ ДЛЯ ВСЕХ" if access_db.get("open_mode", False) else "🔒 ЗАКРЫТЫЙ (По заявкам)"
     kb = InlineKeyboardBuilder()
     kb.button(text="➕ Выдать доступ", callback_data="adm_add_user")
     kb.button(text="❌ Удалить доступ", callback_data="adm_del_user_menu")
@@ -1005,12 +674,7 @@ def build_admin_panel_view():
     kb.button(text="🍪 Обновить Куки", callback_data="adm_set_cookie")
     kb.button(text="🔄 Переподключить Веб", callback_data="reconnect_web")
     kb.button(text="🗑 Очистить чаты на сайте", callback_data="wipe_all_chats")
-
-    lines = [
-        "👑 <b>Панель управления (@targetturtle)</b>",
-        f"⚙️ Режим входа: <b>{mode_str}</b>\n",
-    ]
-
+    lines = ["👑 <b>Панель управления (@targetturtle)</b>", f"⚙️ Режим входа: <b>{mode_str}</b>\n"]
     now = time.time()
     active_count = 0
     for uid_str, info in list(users.items()):
@@ -1021,21 +685,13 @@ def build_admin_panel_view():
         active_count += 1
         reqs = stats_store["user_reqs"].get(uid_str, 0)
         rem = "♾ Навсегда" if exp == 0 else f"⏳ Осталось: {format_duration_text(int(exp - now))}"
-        u_name = html.escape(info.get("name", uid_str))
         is_u_adm = "👑 " if int(uid_str) in [int(x) for x in access_db.get("admins", [])] else ""
-        lines.append(f"• {is_u_adm}<b>{u_name}</b> ({rem} | Запросов: {reqs})")
-
+        lines.append(f"• {is_u_adm}<b>{html.escape(info.get('name', uid_str))}</b> ({rem} | Запросов: {reqs})")
     pre = access_db.get("preapproved_usernames", {})
     if pre:
-        pre_items = []
-        for k, v in pre.items():
-            dur_s = v.get("duration", 0) if isinstance(v, dict) else 0
-            pre_items.append(f"@{k} ({format_duration_text(dur_s)})")
-        lines.append("\n⏳ <b>Ожидают первого входа:</b> " + ", ".join(pre_items))
-
+        lines.append("\n⏳ <b>Ожидают входа:</b> " + ", ".join([f"@{k} ({format_duration_text(v.get('duration', 0) if isinstance(v, dict) else 0)})" for k, v in pre.items()]))
     if active_count == 0 and not pre:
         lines.append("Сейчас активных клиентов нет.")
-
     save_access_db(access_db)
     kb.adjust(2, 2, 2, 2, 2)
     return "\n".join(lines), kb.as_markup()
@@ -1045,25 +701,13 @@ def create_dispatcher(bot_inst: Bot):
 
     @d.message(CommandStart())
     async def start_cmd(message: types.Message):
-        uid = message.from_user.id
-        uname = message.from_user.username
+        uid, uname = message.from_user.id, message.from_user.username
         if not check_access(message.from_user):
-            await message.answer(
-                "🔒 <b>Доступ к этому боту закрыт.</b>\n\n"
-                "Нажми кнопку ниже, чтобы отправить заявку владельцу:",
-                parse_mode="HTML",
-                reply_markup=get_locked_kb()
-            )
+            await message.answer("🔒 <b>Доступ к этому боту закрыт.</b>\n\nНажми кнопку ниже, чтобы отправить заявку владельцу:", parse_mode="HTML", reply_markup=get_locked_kb())
             return
-
         prefs = get_prefs(uid)
         r_label = dict((v, k) for k, v in REASONING_LIST).get(prefs["reasoning"], prefs["reasoning"])
-        await message.answer(
-            f"Модель: <b>{prefs['model_label']}</b>\n"
-            f"Уровень рассуждений: <b>{r_label}</b>",
-            parse_mode="HTML",
-            reply_markup=get_main_reply_kb(uid, uname)
-        )
+        await message.answer(f"Модель: <b>{prefs['model_label']}</b>\nУровень рассуждений: <b>{r_label}</b>", parse_mode="HTML", reply_markup=get_main_reply_kb(uid, uname))
 
     @d.callback_query(F.data == "req_access")
     async def cb_req_access(call: types.CallbackQuery):
@@ -1071,15 +715,12 @@ def create_dispatcher(bot_inst: Bot):
         if check_access(call.from_user):
             await call.answer("У тебя уже есть доступ!")
             return
-
         admin_targets = list(set(([access_db["admin_id"]] if access_db.get("admin_id") else []) + access_db.get("admins", [])))
         if not admin_targets:
             await call.answer("Ожидай входа владельца @targetturtle.", show_alert=True)
             return
-
         u_name = html.escape(call.from_user.full_name or "Без имени")
         u_nick = f"@{call.from_user.username}" if call.from_user.username else "без юзернейма"
-
         kb = InlineKeyboardBuilder()
         kb.button(text="📅 Сутки (24ч)", callback_data=f"dur_apply:{uid}:86400")
         kb.button(text="📆 Неделя", callback_data=f"dur_apply:{uid}:604800")
@@ -1089,30 +730,17 @@ def create_dispatcher(bot_inst: Bot):
         kb.button(text="👑 Сделать Админом", callback_data=f"makeadm:{uid}")
         kb.button(text="❌ Отказать", callback_data=f"deny:{uid}")
         kb.adjust(2, 2, 1, 1, 1)
-
         for adm_id in admin_targets:
-            try:
-                await bot_inst.send_message(
-                    int(adm_id),
-                    f"🔔 <b>Заявка на доступ!</b>\n"
-                    f"👤 Имя: {u_name} ({u_nick})\n"
-                    f"🆔 ID: <code>{uid}</code>",
-                    parse_mode="HTML",
-                    reply_markup=kb.as_markup()
-                )
-            except Exception:
-                pass
-
+            try: await bot_inst.send_message(int(adm_id), f"🔔 <b>Заявка на доступ!</b>\n👤 Имя: {u_name} ({u_nick})\n🆔 ID: <code>{uid}</code>", parse_mode="HTML", reply_markup=kb.as_markup())
+            except Exception: pass
         await call.answer("Заявка отправлена!")
         await call.message.edit_text("⏳ <b>Заявка отправлена владельцу!</b> Ожидай подтверждения.", parse_mode="HTML")
 
     @d.callback_query(F.data.startswith("dur_apply:"))
     async def cb_dur_apply(call: types.CallbackQuery):
-        if not is_admin(call.from_user.id, call.from_user.username):
-            return
+        if not is_admin(call.from_user.id, call.from_user.username): return
         _, target_key, seconds_str = call.data.split(":", 2)
-        seconds = int(seconds_str)
-        msg_res = await apply_user_grant(bot_inst, target_key, seconds)
+        msg_res = await apply_user_grant(bot_inst, target_key, int(seconds_str))
         kb = InlineKeyboardBuilder()
         kb.button(text="🔙 В Админку", callback_data="adm_back")
         await call.answer("Доступ выдан!")
@@ -1120,104 +748,73 @@ def create_dispatcher(bot_inst: Bot):
 
     @d.callback_query(F.data.startswith("dur_custom:"))
     async def cb_dur_custom(call: types.CallbackQuery):
-        if not is_admin(call.from_user.id, call.from_user.username):
-            return
+        if not is_admin(call.from_user.id, call.from_user.username): return
         target_key = call.data.split(":", 1)[1]
         pending_grant_target[call.from_user.id] = target_key
         admin_input_state[call.from_user.id] = "wait_custom_duration"
         kb = InlineKeyboardBuilder()
         kb.button(text="🔙 Отмена", callback_data="adm_back")
         await call.answer()
-        await call.message.edit_text(
-            f"⏱ <b>Своё время доступа для</b> <code>{html.escape(target_key)}</code>\n\n"
-            "Напиши время следующим сообщением в любом удобном формате:\n"
-            "• <code>1 час 30 минут</code>\n"
-            "• <code>1 час</code>\n"
-            "• <code>33 часа</code>\n"
-            "• <code>45 минут</code>",
-            parse_mode="HTML",
-            reply_markup=kb.as_markup()
-        )
+        await call.message.edit_text(f"⏱ <b>Своё время для</b> <code>{html.escape(target_key)}</code>\n\nНапиши время (например: <code>1 час 30 минут</code>, <code>1 час</code>, <code>33 часа</code>, <code>45 минут</code>):", parse_mode="HTML", reply_markup=kb.as_markup())
 
     @d.callback_query(F.data.startswith("makeadm:"))
     async def cb_makeadm(call: types.CallbackQuery):
-        if not is_admin(call.from_user.id, call.from_user.username):
-            return
+        if not is_admin(call.from_user.id, call.from_user.username): return
         target_uid = int(call.data.split(":")[1])
-        if target_uid not in access_db.setdefault("admins", []):
-            access_db["admins"].append(target_uid)
+        if target_uid not in access_db.setdefault("admins", []): access_db["admins"].append(target_uid)
         access_db.setdefault("users", {})[str(target_uid)] = {"name": f"Admin {target_uid}", "expires_at": 0}
         save_access_db(access_db)
         await call.answer("Назначен админом!")
         await call.message.edit_text(f"👑 Пользователь <code>{target_uid}</code> назначен <b>Администратором</b>!", parse_mode="HTML")
-        try:
-            await bot_inst.send_message(
-                target_uid,
-                "👑 <b>Тебе выданы права Администратора бота!</b>",
-                parse_mode="HTML",
-                reply_markup=get_main_reply_kb(target_uid)
-            )
-        except Exception:
-            pass
+        try: await bot_inst.send_message(target_uid, "👑 <b>Тебе выданы права Администратора бота!</b>", parse_mode="HTML", reply_markup=get_main_reply_kb(target_uid))
+        except Exception: pass
 
     @d.callback_query(F.data.startswith("deny:"))
     async def cb_deny(call: types.CallbackQuery):
-        if not is_admin(call.from_user.id, call.from_user.username):
-            return
+        if not is_admin(call.from_user.id, call.from_user.username): return
         target_uid = int(call.data.split(":")[1])
         await call.answer("Отклонено")
         await call.message.edit_text(f"❌ Заявка <code>{target_uid}</code> отклонена.", parse_mode="HTML")
-        try:
-            await bot_inst.send_message(target_uid, "❌ Владелец отклонил заявку на доступ.")
-        except Exception:
-            pass
+        try: await bot_inst.send_message(target_uid, "❌ Владелец отклонил заявку на доступ.")
+        except Exception: pass
 
     @d.message(F.text == "👑 Админка")
     async def admin_panel(message: types.Message):
         sync_user_identity(message.from_user)
-        uid = message.from_user.id
-        uname = message.from_user.username
+        uid, uname = message.from_user.id, message.from_user.username
         if not is_admin(uid, uname):
             await message.answer("⛔ Доступ только для администратора.", reply_markup=get_main_reply_kb(uid, uname))
             return
-
         admin_input_state.pop(uid, None)
         text, markup = build_admin_panel_view()
         await message.answer(text, parse_mode="HTML", reply_markup=markup)
 
     @d.callback_query(F.data == "adm_back")
     async def cb_adm_back(call: types.CallbackQuery):
-        if not is_admin(call.from_user.id, call.from_user.username):
-            return
+        if not is_admin(call.from_user.id, call.from_user.username): return
         admin_input_state.pop(call.from_user.id, None)
         text, markup = build_admin_panel_view()
         await call.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
 
     @d.callback_query(F.data == "adm_inspect_models")
     async def cb_adm_inspect_models(call: types.CallbackQuery):
-        if not is_admin(call.from_user.id, call.from_user.username):
-            return
+        if not is_admin(call.from_user.id, call.from_user.username): return
         await call.answer("Считываю модели клиента...")
         kb = InlineKeyboardBuilder()
         kb.button(text="🔙 Назад", callback_data="adm_back")
         try:
             client = await get_web_client()
-            inject_missing_models_into_client(client)
             models = client.list_models() if hasattr(client, "list_models") else []
-            out = ["🔍 <b>Модели, подключенные в клиенте:</b>\n"]
+            out = ["🔍 <b>Модели в клиенте:</b>\n"]
             for m in models:
-                d_n = html.escape(str(getattr(m, "display_name", "")))
-                m_n = html.escape(str(getattr(m, "model_name", "")))
-                hdr = html.escape(str(getattr(m, "model_header", "")))
-                out.append(f"• <b>{d_n}</b> (<code>{m_n}</code>)\n<code>{hdr}</code>\n")
+                out.append(f"• <b>{html.escape(str(getattr(m, 'display_name', '')))}</b> (<code>{html.escape(str(getattr(m, 'model_name', '')))}</code>)\n<code>{html.escape(str(getattr(m, 'model_header', '')))}</code>\n")
             await call.message.edit_text("\n".join(out)[:3900], parse_mode="HTML", reply_markup=kb.as_markup())
         except Exception as e:
             await call.message.edit_text(f"Ошибка: <code>{html.escape(str(e))}</code>", parse_mode="HTML", reply_markup=kb.as_markup())
 
     @d.callback_query(F.data == "adm_toggle_mode")
     async def cb_adm_toggle_mode(call: types.CallbackQuery):
-        if not is_admin(call.from_user.id, call.from_user.username):
-            return
+        if not is_admin(call.from_user.id, call.from_user.username): return
         access_db["open_mode"] = not access_db.get("open_mode", False)
         save_access_db(access_db)
         await call.answer("Режим переключен!")
@@ -1226,23 +823,16 @@ def create_dispatcher(bot_inst: Bot):
 
     @d.callback_query(F.data == "adm_add_user")
     async def cb_adm_add_user(call: types.CallbackQuery):
-        if not is_admin(call.from_user.id, call.from_user.username):
-            return
+        if not is_admin(call.from_user.id, call.from_user.username): return
         admin_input_state[call.from_user.id] = "wait_add_user_target"
         kb = InlineKeyboardBuilder()
         kb.button(text="🔙 Назад", callback_data="adm_back")
         await call.answer()
-        await call.message.edit_text(
-            "➕ <b>Выдача доступа по @юзу или ID</b>\n\n"
-            "Напиши следующим сообщением <code>@username</code> (или ID) человека, которому хочешь выдать доступ:",
-            parse_mode="HTML",
-            reply_markup=kb.as_markup()
-        )
+        await call.message.edit_text("➕ <b>Выдача доступа по @юзу или ID</b>\n\nНапиши следующим сообщением <code>@username</code> (или ID):", parse_mode="HTML", reply_markup=kb.as_markup())
 
     @d.callback_query(F.data == "adm_del_user_menu")
     async def cb_adm_del_user_menu(call: types.CallbackQuery):
-        if not is_admin(call.from_user.id, call.from_user.username):
-            return
+        if not is_admin(call.from_user.id, call.from_user.username): return
         admin_input_state[call.from_user.id] = "wait_del_user_target"
         kb = InlineKeyboardBuilder()
         for uid_str, info in list(access_db.get("users", {}).items()):
@@ -1252,38 +842,24 @@ def create_dispatcher(bot_inst: Bot):
         kb.button(text="🔙 Назад", callback_data="adm_back")
         kb.adjust(1)
         await call.answer()
-        await call.message.edit_text(
-            "❌ <b>Удаление доступа</b>\n\n"
-            "Нажми на пользователя в списке ниже, чтобы забрать доступ, ИЛИ просто отправь его <code>@username</code> / <code>ID</code> следующим сообщением:",
-            parse_mode="HTML",
-            reply_markup=kb.as_markup()
-        )
+        await call.message.edit_text("❌ <b>Удаление доступа</b>\n\nНажми на человека ниже ИЛИ отправь его <code>@username</code> / <code>ID</code> сообщением:", parse_mode="HTML", reply_markup=kb.as_markup())
 
     @d.callback_query(F.data == "adm_manage_admins")
     async def cb_adm_manage_admins(call: types.CallbackQuery):
-        if not is_admin(call.from_user.id, call.from_user.username):
-            return
+        if not is_admin(call.from_user.id, call.from_user.username): return
         admin_input_state[call.from_user.id] = "wait_add_admin"
         cur_adms = access_db.get("admin_usernames", [OWNER_USERNAME])
         kb = InlineKeyboardBuilder()
         for u in cur_adms:
-            if u.lower() != OWNER_USERNAME:
-                kb.button(text=f"❌ Снять админа @{u}", callback_data=f"rmadm:{u}")
+            if u.lower() != OWNER_USERNAME: kb.button(text=f"❌ Снять админа @{u}", callback_data=f"rmadm:{u}")
         kb.button(text="🔙 Назад", callback_data="adm_back")
         kb.adjust(1)
         await call.answer()
-        await call.message.edit_text(
-            "👑 <b>Управление Администраторами</b>\n\n"
-            f"Текущие админы по юзу: {', '.join(['@' + x for x in cur_adms])}\n\n"
-            "Чтобы назначить нового админа — просто отправь его <code>@username</code> или ID следующим сообщением:",
-            parse_mode="HTML",
-            reply_markup=kb.as_markup()
-        )
+        await call.message.edit_text(f"👑 <b>Администраторы:</b> {', '.join(['@' + x for x in cur_adms])}\n\nОтправь <code>@username</code> или ID нового админа:", parse_mode="HTML", reply_markup=kb.as_markup())
 
     @d.callback_query(F.data.startswith("rmadm:"))
     async def cb_rmadm(call: types.CallbackQuery):
-        if not is_admin(call.from_user.id, call.from_user.username):
-            return
+        if not is_admin(call.from_user.id, call.from_user.username): return
         u_to_rm = call.data.split(":", 1)[1].lower()
         if u_to_rm != OWNER_USERNAME and u_to_rm in access_db.get("admin_usernames", []):
             access_db["admin_usernames"].remove(u_to_rm)
@@ -1293,40 +869,26 @@ def create_dispatcher(bot_inst: Bot):
 
     @d.callback_query(F.data == "adm_broadcast")
     async def cb_adm_broadcast(call: types.CallbackQuery):
-        if not is_admin(call.from_user.id, call.from_user.username):
-            return
+        if not is_admin(call.from_user.id, call.from_user.username): return
         admin_input_state[call.from_user.id] = "wait_broadcast"
         kb = InlineKeyboardBuilder()
         kb.button(text="🔙 Назад", callback_data="adm_back")
         await call.answer()
-        await call.message.edit_text(
-            "📢 <b>Рассылка всем пользователям</b>\n\n"
-            "Напиши следующим сообщением текст объявления — бот отправит его всем твоим клиентам:",
-            parse_mode="HTML",
-            reply_markup=kb.as_markup()
-        )
+        await call.message.edit_text("📢 <b>Рассылка всем пользователям</b>\n\nНапиши текст объявления:", parse_mode="HTML", reply_markup=kb.as_markup())
 
     @d.callback_query(F.data == "adm_set_cookie")
     async def cb_adm_set_cookie(call: types.CallbackQuery):
-        if not is_admin(call.from_user.id, call.from_user.username):
-            return
+        if not is_admin(call.from_user.id, call.from_user.username): return
         admin_input_state[call.from_user.id] = "wait_cookie"
         kb = InlineKeyboardBuilder()
         kb.button(text="🔙 Назад", callback_data="adm_back")
         await call.answer()
-        await call.message.edit_text(
-            "🍪 <b>Обновление Куки</b>\n\n"
-            "Отправь следующим сообщением новые куки через пробел:\n"
-            "<code>ТВОЙ_1PSID ТВОЙ_1PSIDTS</code>",
-            parse_mode="HTML",
-            reply_markup=kb.as_markup()
-        )
+        await call.message.edit_text("🍪 <b>Обновление Куки</b>\n\nОтправь через пробел:\n<code>ТВОЙ_1PSID ТВОЙ_1PSIDTS</code>", parse_mode="HTML", reply_markup=kb.as_markup())
 
     @d.callback_query(F.data == "wipe_all_chats")
     async def cb_wipe_all_chats(call: types.CallbackQuery):
-        if not is_admin(call.from_user.id, call.from_user.username):
-            return
-        await call.answer("Удаляю все чаты с сайта Gemini...")
+        if not is_admin(call.from_user.id, call.from_user.username): return
+        await call.answer("Удаляю все чаты...")
         deleted_count = 0
         try:
             client = await get_web_client()
@@ -1334,53 +896,36 @@ def create_dispatcher(bot_inst: Bot):
                 await delete_old_web_chat(int(uid_str))
                 deleted_count += 1
             if hasattr(client, "list_chats") and hasattr(client, "delete_chat"):
-                chats = await client.list_chats()
-                if chats:
-                    for ch in chats:
-                        cid = getattr(ch, "cid", None)
-                        if cid:
-                            try:
-                                await client.delete_chat(cid)
-                                deleted_count += 1
-                            except Exception:
-                                pass
+                for ch in (await client.list_chats() or []):
+                    cid = getattr(ch, "cid", None)
+                    if cid:
+                        try:
+                            await client.delete_chat(cid)
+                            deleted_count += 1
+                        except Exception: pass
             web_chats.clear()
             kb = InlineKeyboardBuilder()
-            kb.button(text="🔙 Назад в Админку", callback_data="adm_back")
-            await call.message.edit_text(
-                f"🗑 <b>Готово! Удалено чатов с сайта Gemini: {deleted_count}</b>",
-                parse_mode="HTML",
-                reply_markup=kb.as_markup()
-            )
+            kb.button(text="🔙 Назад", callback_data="adm_back")
+            await call.message.edit_text(f"🗑 <b>Удалено чатов: {deleted_count}</b>", parse_mode="HTML", reply_markup=kb.as_markup())
         except Exception as e:
-            await call.message.edit_text(f"⚠️ Ошибка при очистке чатов: <code>{html.escape(str(e))}</code>", parse_mode="HTML")
+            await call.message.edit_text(f"⚠️ Ошибка: <code>{html.escape(str(e))}</code>", parse_mode="HTML")
 
     @d.callback_query(F.data == "check_limits")
     async def cb_check_limits(call: types.CallbackQuery):
-        if not is_admin(call.from_user.id, call.from_user.username):
-            return
-        await call.answer("Опрашиваю Google напрямую...")
-        err_detail = ""
-        direct_ok = False
+        if not is_admin(call.from_user.id, call.from_user.username): return
+        await call.answer("Опрашиваю Google...")
+        err_detail, direct_ok = "", False
         try:
             client = await get_web_client()
             direct_ok = await refresh_live_quotas(client)
-            if hasattr(client, "_fetch_abuse_status"):
-                await client._fetch_abuse_status()
+            if hasattr(client, "_fetch_abuse_status"): await client._fetch_abuse_status()
             inject_missing_models_into_client(client)
         except Exception as e:
             err_detail = str(e)
 
-        if direct_ok:
-            cookie_ok = "✅ Активны (Авторизован в Pro)"
-        elif err_detail:
-            cookie_ok = f"❌ Ошибка ({html.escape(err_detail)})"
-        else:
-            cookie_ok = "❌ Разлогинены (квота Pro не получена)"
-
-        web_style_limits = format_limits_like_web()
+        cookie_ok = "✅ Активны (Авторизован в Pro)" if direct_ok else (f"❌ Ошибка ({html.escape(err_detail)})" if err_detail else "❌ Разлогинены (квота Pro не получена)")
         report = (
-            f"{web_style_limits}\n\n"
+            f"{format_limits_like_web()}\n\n"
             "────────────────────\n"
             f"🍪 <b>Статус Куки:</b> {cookie_ok}\n"
             f"🛡 <b>Аккаунт:</b> {abuse_status_store}\n"
@@ -1391,32 +936,25 @@ def create_dispatcher(bot_inst: Bot):
         kb.button(text="🍪 Сменить куки", callback_data="adm_set_cookie")
         kb.button(text="🔙 Назад", callback_data="adm_back")
         kb.adjust(2, 1)
-        try:
-            await call.message.edit_text(report, parse_mode="HTML", reply_markup=kb.as_markup())
-        except Exception:
-            await call.message.answer(report, parse_mode="HTML", reply_markup=kb.as_markup())
+        try: await call.message.edit_text(report, parse_mode="HTML", reply_markup=kb.as_markup())
+        except Exception: await call.message.answer(report, parse_mode="HTML", reply_markup=kb.as_markup())
 
     @d.callback_query(F.data == "reconnect_web")
     async def cb_reconnect_web(call: types.CallbackQuery):
-        if not is_admin(call.from_user.id, call.from_user.username):
-            return
+        if not is_admin(call.from_user.id, call.from_user.username): return
         await call.answer("Переподключаю веб-сессию...")
         kb = InlineKeyboardBuilder()
-        kb.button(text="🔙 Назад в Админку", callback_data="adm_back")
+        kb.button(text="🔙 Назад", callback_data="adm_back")
         try:
             await get_web_client(force_reinit=True)
-            if live_quotas:
-                msg_st = "✅ <b>Веб-сессия Gemini Pro переподключена, квота Pro подтверждена!</b>"
-            else:
-                msg_st = "⚠️ <b>Сессия запущена, но Google не вернул квоты Pro (проверь куки в «🍪 Обновить Куки»).</b>"
+            msg_st = "✅ <b>Веб-сессия Gemini Pro переподключена, квота Pro подтверждена!</b>" if live_quotas else "⚠️ <b>Сессия запущена, но Google не вернул квоты Pro (проверь куки).</b>"
             await call.message.edit_text(msg_st, parse_mode="HTML", reply_markup=kb.as_markup())
         except Exception as e:
-            await call.message.edit_text(f"⚠️ Не удалось переподключить Веб: <code>{html.escape(str(e))}</code>", parse_mode="HTML", reply_markup=kb.as_markup())
+            await call.message.edit_text(f"⚠️ Ошибка: <code>{html.escape(str(e))}</code>", parse_mode="HTML", reply_markup=kb.as_markup())
 
     @d.callback_query(F.data.startswith("revoke:"))
     async def cb_revoke(call: types.CallbackQuery):
-        if not is_admin(call.from_user.id, call.from_user.username):
-            return
+        if not is_admin(call.from_user.id, call.from_user.username): return
         target_key = call.data.split(":", 1)[1]
         await revoke_user_by_key(bot_inst, target_key)
         await call.answer("Доступ удалён!")
@@ -1427,8 +965,7 @@ def create_dispatcher(bot_inst: Bot):
     @d.message(Command("clear"))
     async def clear_cmd(message: types.Message):
         uid = message.from_user.id
-        if not check_access(message.from_user):
-            return
+        if not check_access(message.from_user): return
         await delete_old_web_chat(uid)
         user_history[uid] = []
         await message.answer("Старый чат удалён с сайта, начат новый.", reply_markup=get_main_reply_kb(uid, message.from_user.username))
@@ -1436,64 +973,51 @@ def create_dispatcher(bot_inst: Bot):
     @d.message(F.text == "Модель")
     async def menu_models(message: types.Message):
         uid = message.from_user.id
-        if not check_access(message.from_user):
-            return
-        prefs = get_prefs(uid)
-        cur = prefs["model"]
-
+        if not check_access(message.from_user): return
+        cur = get_prefs(uid)["model"]
         kb = InlineKeyboardBuilder()
         for label, code in MODELS_LIST:
-            mark = "✓ " if cur == code else ""
-            kb.button(text=f"{mark}{label}", callback_data=f"model:{code}:{label}")
+            kb.button(text=f"{'✓ ' if cur == code else ''}{label}", callback_data=f"model:{code}:{label}")
         kb.adjust(1)
         await message.answer("Модель:", reply_markup=kb.as_markup())
 
     @d.callback_query(F.data.startswith("model:"))
     async def cb_model(call: types.CallbackQuery):
         uid = call.from_user.id
-        if not check_access(call.from_user):
-            return
+        if not check_access(call.from_user): return
         _, code, label = call.data.split(":", 2)
         prefs = get_prefs(uid)
-        prefs["model"] = code
-        prefs["model_label"] = label
+        prefs["model"], prefs["model_label"] = code, label
         try:
             client = await get_web_client()
             target_model = resolve_model_clean(client, code, prefs["reasoning"])
-            if uid in web_chats and target_model:
-                web_chats[uid].model = target_model
-        except Exception:
-            pass
+            if uid in web_chats and target_model: web_chats[uid].model = target_model
+        except Exception: pass
         await call.answer()
         await call.message.edit_text(f"Модель: <b>{label}</b>", parse_mode="HTML")
 
     @d.message(F.text == "Уровень рассуждений")
     async def menu_reasoning(message: types.Message):
-        if not check_access(message.from_user):
-            return
+        if not check_access(message.from_user): return
         cur = get_prefs(message.from_user.id)["reasoning"]
         kb = InlineKeyboardBuilder()
         for label, code in REASONING_LIST:
-            mark = "✓ " if cur == code else ""
-            kb.button(text=f"{mark}{label}", callback_data=f"reason:{code}")
+            kb.button(text=f"{'✓ ' if cur == code else ''}{label}", callback_data=f"reason:{code}")
         kb.adjust(1)
         await message.answer("Уровень рассуждений:", reply_markup=kb.as_markup())
 
     @d.callback_query(F.data.startswith("reason:"))
     async def cb_reason(call: types.CallbackQuery):
         uid = call.from_user.id
-        if not check_access(call.from_user):
-            return
+        if not check_access(call.from_user): return
         code = call.data.split(":", 1)[1]
         prefs = get_prefs(uid)
         prefs["reasoning"] = code
         try:
             client = await get_web_client()
             target_model = resolve_model_clean(client, prefs["model"], code)
-            if uid in web_chats and target_model:
-                web_chats[uid].model = target_model
-        except Exception:
-            pass
+            if uid in web_chats and target_model: web_chats[uid].model = target_model
+        except Exception: pass
         label = dict((v, k) for k, v in REASONING_LIST).get(code, code)
         await call.answer()
         await call.message.edit_text(f"Уровень рассуждений: <b>{label}</b>", parse_mode="HTML")
@@ -1501,23 +1025,18 @@ def create_dispatcher(bot_inst: Bot):
     @d.message(F.text == "Инструменты")
     async def menu_tools(message: types.Message):
         uid = message.from_user.id
-        if not check_access(message.from_user):
-            return
-        prefs = get_prefs(uid)
-        cur = prefs["tool"]
-
+        if not check_access(message.from_user): return
+        cur = get_prefs(uid)["tool"]
         kb = InlineKeyboardBuilder()
         for label, code in TOOLS_LIST:
-            mark = "✓ " if cur == code else ""
-            kb.button(text=f"{mark}{label}", callback_data=f"tool:{code}")
+            kb.button(text=f"{'✓ ' if cur == code else ''}{label}", callback_data=f"tool:{code}")
         kb.adjust(1)
         await message.answer("Инструменты:", reply_markup=kb.as_markup())
 
     @d.callback_query(F.data.startswith("tool:"))
     async def cb_tool(call: types.CallbackQuery):
         uid = call.from_user.id
-        if not check_access(call.from_user):
-            return
+        if not check_access(call.from_user): return
         code = call.data.split(":", 1)[1]
         get_prefs(uid)["tool"] = code
         label = dict((v, k) for k, v in TOOLS_LIST).get(code, code)
@@ -1526,8 +1045,7 @@ def create_dispatcher(bot_inst: Bot):
 
     @d.message(F.text)
     async def handle_text(message: types.Message):
-        uid = message.from_user.id
-        uname = message.from_user.username
+        uid, uname = message.from_user.id, message.from_user.username
         if not check_access(message.from_user):
             await message.answer("🔒 Доступ закрыт. Отправь заявку владельцу:", reply_markup=get_locked_kb())
             return
@@ -1535,16 +1053,10 @@ def create_dispatcher(bot_inst: Bot):
         if is_admin(uid, uname) and uid in admin_input_state:
             mode = admin_input_state.pop(uid)
             val = message.text.strip()
-
             if mode == "wait_add_user_target":
                 clean_target = val.lstrip("@").lower().strip()
-                await message.answer(
-                    f"⏳ Выбери срок доступа для <b>@{html.escape(clean_target)}</b>:",
-                    parse_mode="HTML",
-                    reply_markup=build_duration_picker_kb(clean_target)
-                )
+                await message.answer(f"⏳ Выбери срок доступа для <b>@{html.escape(clean_target)}</b>:", parse_mode="HTML", reply_markup=build_duration_picker_kb(clean_target))
                 return
-
             elif mode == "wait_custom_duration":
                 target_key = pending_grant_target.pop(uid, None)
                 if not target_key:
@@ -1554,43 +1066,33 @@ def create_dispatcher(bot_inst: Bot):
                 if seconds < 0:
                     admin_input_state[uid] = "wait_custom_duration"
                     pending_grant_target[uid] = target_key
-                    await message.answer(
-                        "⚠️ Не понял формат времени. Напиши, например: <code>1 час 30 минут</code>, <code>33 часа</code> или <code>45 минут</code>:",
-                        parse_mode="HTML"
-                    )
+                    await message.answer("⚠️ Напиши время в формате: <code>1 час 30 минут</code>, <code>33 часа</code> или <code>45 минут</code>:", parse_mode="HTML")
                     return
                 res_msg = await apply_user_grant(bot_inst, target_key, seconds)
                 await message.answer(res_msg, parse_mode="HTML", reply_markup=get_main_reply_kb(uid, uname))
                 return
-
             elif mode == "wait_del_user_target":
                 res_msg = await revoke_user_by_key(bot_inst, val)
                 await message.answer(res_msg, parse_mode="HTML", reply_markup=get_main_reply_kb(uid, uname))
                 return
-
             elif mode == "wait_add_admin":
                 clean_u = val.lstrip("@").lower()
                 if clean_u.isdigit():
-                    if int(clean_u) not in access_db.setdefault("admins", []):
-                        access_db["admins"].append(int(clean_u))
+                    if int(clean_u) not in access_db.setdefault("admins", []): access_db["admins"].append(int(clean_u))
                 else:
-                    if clean_u not in access_db.setdefault("admin_usernames", []):
-                        access_db["admin_usernames"].append(clean_u)
+                    if clean_u not in access_db.setdefault("admin_usernames", []): access_db["admin_usernames"].append(clean_u)
                 save_access_db(access_db)
                 await message.answer(f"👑 Пользователь <b>@{clean_u}</b> назначен Администратором!", parse_mode="HTML", reply_markup=get_main_reply_kb(uid, uname))
                 return
-
             elif mode == "wait_broadcast":
                 sent = 0
                 for target_u in list(access_db.get("users", {}).keys()):
                     try:
-                        await bot_inst.send_message(int(target_u), f"📢 <b>Сообщение от администратора:</b>\n\n{html.escape(val)}", parse_mode="HTML")
+                        await bot_inst.send_message(int(target_u), f"📢 <b>Объявление:</b>\n\n{html.escape(val)}", parse_mode="HTML")
                         sent += 1
-                    except Exception:
-                        pass
+                    except Exception: pass
                 await message.answer(f"✅ Рассылка отправлена ({sent} чел.)!", reply_markup=get_main_reply_kb(uid, uname))
                 return
-
             elif mode == "wait_cookie":
                 parts = val.split()
                 access_db["custom_psid"] = parts[0].strip()
@@ -1598,7 +1100,106 @@ def create_dispatcher(bot_inst: Bot):
                 save_access_db(access_db)
                 try:
                     await get_web_client(force_reinit=True)
-                    if live_quotas:
-                        await message.answer("✅ <b>Новые куки сохранены, квота Pro подтверждена!</b>", parse_mode="HTML", reply_markup=get_main_reply_kb(uid, uname))
-                    else:
-                        await message.answer("⚠️ <b>Куки записаны, но Google не отдал квоту Pro (проверь правильность 1PSID и 1PSIDTS).</b>", parse_
+                    st_msg = "✅ <b>Новые куки сохранены, квота Pro подтверждена!</b>" if live_quotas else "⚠️ <b>Куки записаны, но Google не отдал квоту Pro (проверь 1PSID и 1PSIDTS).</b>"
+                    await message.answer(st_msg, parse_mode="HTML", reply_markup=get_main_reply_kb(uid, uname))
+                except Exception as e:
+                    await message.answer(f"⚠️ Ошибка куков: <code>{html.escape(str(e))}</code>", parse_mode="HTML")
+                return
+
+        async with continuous_typing(bot_inst, message.chat.id, "typing"):
+            try:
+                await ask_gemini_web(bot_inst, message, message.text)
+            except Exception as web_err:
+                try:
+                    err_name = f"{type(web_err).__name__}: {web_err}".strip(": ")
+                    ans, used_model = await ask_gemini_fallback(uid, message.text, message.text)
+                    await safe_send(message, f"⚠️ [Запасной API ({used_model}) | Веб: {err_name}]\n\n{ans}")
+                except Exception as e:
+                    await message.answer(f"Ошибка: {e}", reply_markup=get_main_reply_kb(uid, uname))
+
+    @d.message(F.photo)
+    async def handle_photo(message: types.Message):
+        uid, uname = message.from_user.id, message.from_user.username
+        if not check_access(message.from_user):
+            await message.answer("🔒 Доступ закрыт.", reply_markup=get_locked_kb())
+            return
+        temp_path = f"/tmp/photo_{uid}.jpg"
+        async with continuous_typing(bot_inst, message.chat.id, "typing"):
+            try:
+                photo = message.photo[-1]
+                file_io = io.BytesIO()
+                await bot_inst.download(photo, destination=file_io)
+                file_io.seek(0)
+                with open(temp_path, "wb") as f: f.write(file_io.getvalue())
+                caption = message.caption or "Реши или опиши фото."
+                try:
+                    await ask_gemini_web(bot_inst, message, caption, file_path=temp_path)
+                except Exception as web_err:
+                    err_name = f"{type(web_err).__name__}: {web_err}".strip(": ")
+                    image = Image.open(file_io)
+                    image.load()
+                    ans, used_model = await ask_gemini_fallback(uid, [caption, image], f"[Фото] {caption}")
+                    await safe_send(message, f"⚠️ [Запасной API ({used_model}) | Веб: {err_name}]\n\n{ans}")
+            except Exception as e:
+                await message.answer(f"Ошибка: {e}", reply_markup=get_main_reply_kb(uid, uname))
+            finally:
+                if os.path.exists(temp_path): os.remove(temp_path)
+
+    @d.message(F.document)
+    async def handle_document(message: types.Message):
+        uid, uname = message.from_user.id, message.from_user.username
+        if not check_access(message.from_user):
+            await message.answer("🔒 Доступ закрыт.", reply_markup=get_locked_kb())
+            return
+        doc = message.document
+        temp_path = os.path.join("/tmp", doc.file_name or f"file_{uid}")
+        async with continuous_typing(bot_inst, message.chat.id, "typing"):
+            try:
+                file_io = io.BytesIO()
+                await bot_inst.download(doc, destination=file_io)
+                with open(temp_path, "wb") as f: f.write(file_io.getvalue())
+                await ask_gemini_web(bot_inst, message, message.caption or "Проанализируй файл.", file_path=temp_path)
+            except Exception as e:
+                await message.answer(f"Ошибка файла: {e}", reply_markup=get_main_reply_kb(uid, uname))
+            finally:
+                if os.path.exists(temp_path): os.remove(temp_path)
+
+    return d
+
+@st.cache_resource
+def launch_bot_v40():
+    gen_id = time.time()
+    sys._active_tg_gen = gen_id
+    old_state = getattr(sys, "_active_tg_bot", None)
+    if old_state:
+        try:
+            asyncio.run_coroutine_threadsafe(old_state[1].stop_polling(), old_state[0])
+            if len(old_state) > 2 and old_state[2] is not None:
+                asyncio.run_coroutine_threadsafe(old_state[2].session.close(), old_state[0])
+        except Exception:
+            pass
+        time.sleep(1.5)
+
+    def worker():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        bot_inst = Bot(token=TELEGRAM_TOKEN)
+        dp_inst = create_dispatcher(bot_inst)
+        sys._active_tg_bot = (loop, dp_inst, bot_inst)
+        async def runner():
+            while getattr(sys, "_active_tg_gen", None) == gen_id:
+                try:
+                    await bot_inst.delete_webhook(drop_pending_updates=True)
+                    await dp_inst.start_polling(bot_inst, handle_signals=False)
+                except Exception:
+                    await asyncio.sleep(3)
+        loop.run_until_complete(runner())
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    return t
+
+launch_bot_v40()
+
+st.title("Gemini Bot")
+st.success("Активен (@targetturtle)")

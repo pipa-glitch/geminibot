@@ -68,6 +68,7 @@ FULL_MODELS_CATALOG = {
     "argon": ("4 Argon", "gemini-argon", "e6fa609c3fa255c0", 4),
 }
 
+# Передаём точные поля класса AvailableModel из constants.py (name, display_name, model_id, description, capacity, custom_header)
 def make_available_model(client, code: str) -> AvailableModel:
     d_name, m_name, m_hash, t_id = FULL_MODELS_CATALOG.get(code.lower(), FULL_MODELS_CATALOG["flash"])
     hdr = {
@@ -75,33 +76,14 @@ def make_available_model(client, code: str) -> AvailableModel:
         "x-goog-ext-73010989-jspb": "[0]",
         "x-goog-ext-73010990-jspb": "[0,0,0]",
     }
-    # Клонируем существующий валидный объект AvailableModel из клиента, чтобы Pydantic никогда не выдавал ValidationError!
-    if client and hasattr(client, "list_models"):
-        try:
-            existing = client.list_models() or []
-            if existing:
-                base = existing[0]
-                if hasattr(base, "model_copy"):
-                    return base.model_copy(update={"display_name": d_name, "model_header": hdr})
-        except Exception:
-            pass
-    try:
-        return AvailableModel(
-            model_id=m_hash,
-            display_name=d_name,
-            description=d_name,
-            capacity=t_id,
-            model_header=hdr,
-        )
-    except Exception:
-        return AvailableModel(
-            model_id=m_hash,
-            model_name=m_name,
-            display_name=d_name,
-            description=d_name,
-            capacity=t_id,
-            model_header=hdr,
-        )
+    return AvailableModel(
+        name=m_name,
+        display_name=d_name,
+        model_id=m_hash,
+        description=d_name,
+        capacity=t_id,
+        custom_header=hdr,
+    )
 
 def load_access_db():
     if os.path.exists(ACCESS_FILE):
@@ -171,10 +153,10 @@ def _loguru_quota_sink(message):
         raw_ab = text.split("Account abuse status:", 1)[1].strip()
         abuse_status_store = "✅ Чистый (Clean)" if "Clean" in raw_ab else raw_ab
 
-if hasattr(_gw_client, "logger") and not getattr(_gw_client, "_sink_v44", False):
+if hasattr(_gw_client, "logger") and not getattr(_gw_client, "_sink_v45", False):
     try:
         _gw_client.logger.add(_loguru_quota_sink)
-        _gw_client._sink_v44 = True
+        _gw_client._sink_v45 = True
     except Exception:
         pass
 
@@ -216,7 +198,6 @@ def build_duration_picker_kb(target_key: str):
     kb.adjust(2, 2, 1, 1)
     return kb.as_markup()
 
-# Читаем реальные квоты: remaining = entry[1], total = entry[2] (как в исходнике gemini_webapi!)
 async def refresh_live_quotas(client) -> bool:
     if hasattr(client, "_fetch_quota"):
         try: await client._fetch_quota()
@@ -256,6 +237,22 @@ async def refresh_live_quotas(client) -> bool:
                 save_access_db(access_db)
         except Exception: pass
     return bool(access_db.get("quota_short", {}).get("tot") or access_db.get("quota_weekly", {}).get("tot"))
+
+def inject_missing_models_into_client(client):
+    try:
+        models_dict = getattr(client, "_models", None)
+        if isinstance(models_dict, dict):
+            for key in FULL_MODELS_CATALOG:
+                m_obj = make_available_model(client, key)
+                models_dict[m_obj.name] = m_obj
+        elif isinstance(models_dict, list):
+            existing_names = {getattr(m, "name", "") for m in models_dict}
+            for key in FULL_MODELS_CATALOG:
+                m_obj = make_available_model(client, key)
+                if m_obj.name not in existing_names:
+                    models_dict.append(m_obj)
+    except Exception:
+        pass
 
 def format_limits_clean(uid: int = None) -> str:
     tz_msk = timezone(timedelta(hours=3))
@@ -421,11 +418,14 @@ async def get_web_client(force_reinit: bool = False):
         raise Exception("Не указан SECURE_1PSID")
     async with web_init_lock:
         if force_reinit or web_client is None:
-            web_chats.clear()  # Сразу очищаем старые привязанные чаты при смене клиента!
+            web_chats.clear()
             client = GeminiClient(psid, psidts)
             await client.init(timeout=30, auto_refresh=True, refresh_interval=300)
             await refresh_live_quotas(client)
+            inject_missing_models_into_client(client)
             web_client = client
+    if web_client is not None:
+        inject_missing_models_into_client(web_client)
     return web_client
 
 async def delete_old_web_chat(uid: int):
@@ -445,6 +445,7 @@ async def delete_old_web_chat(uid: int):
         pass
 
 def resolve_model_clean(client, model_code: str) -> AvailableModel:
+    inject_missing_models_into_client(client)
     return make_available_model(client, model_code)
 
 @asynccontextmanager
@@ -567,7 +568,6 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
     stats_store["web_ok"] += 1
     stats_store["user_reqs"][str(uid)] = stats_store["user_reqs"].get(str(uid), 0) + 1
 
-    # Отправка ТОЛЬКО родных картинок из ответа Gemini Web (никакого Pollinations!)
     if getattr(response, "images", None):
         for idx, img in enumerate(response.images):
             try:
@@ -1179,7 +1179,6 @@ def create_dispatcher(bot_inst: Bot):
                 stats_store["last_err"] = err_name
                 try:
                     ans, used_model = await ask_gemini_fallback(uid, message.text, message.text)
-                    # Админ видит причину сбоя веба, а обычные юзеры видят ТОЛЬКО чистый ответ!
                     if is_admin(uid, uname):
                         await safe_send(message, f"⚠️ [Админ-инфо: Запасной API ({used_model}) | Веб: {err_name}]\n\n{ans}")
                     else:
@@ -1241,7 +1240,7 @@ def create_dispatcher(bot_inst: Bot):
     return d
 
 @st.cache_resource
-def launch_bot_v44():
+def launch_bot_v45():
     gen_id = time.time()
     sys._active_tg_gen = gen_id
     old_state = getattr(sys, "_active_tg_bot", None)
@@ -1273,7 +1272,7 @@ def launch_bot_v44():
     t.start()
     return t
 
-launch_bot_v44()
+launch_bot_v45()
 
 st.title("Gemini Bot")
 st.success("Активен (@targetturtle)")

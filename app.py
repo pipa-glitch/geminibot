@@ -502,7 +502,7 @@ def is_image_refusal(resp_text: str) -> bool:
     return any(r in low for r in refusals)
 
 # Безотказная генерация картинки (если веб-чат выдал региональный отказ или сработала запаска)
-async def generate_ guaranteed_image(message: types.Message, prompt_ru: str) -> bool:
+async def generate_guaranteed_image(message: types.Message, prompt_ru: str) -> bool:
     uid, uname = message.from_user.id, message.from_user.username
     w, h = parse_requested_dimensions(prompt_ru)
 

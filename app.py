@@ -76,7 +76,14 @@ def make_available_model(code: str, reasoning_code: str = "low") -> AvailableMod
         "x-goog-ext-73010989-jspb": "[0]",
         "x-goog-ext-73010990-jspb": "[0,0,0]",
     }
-    return AvailableModel(model_name=m_name, display_name=d_name, model_header=hdr)
+    return AvailableModel(
+        model_id=m_hash,
+        model_name=m_name,
+        display_name=d_name,
+        description=d_name,
+        capacity=t_id,
+        model_header=hdr,
+    )
 
 def load_access_db():
     if os.path.exists(ACCESS_FILE):
@@ -141,10 +148,10 @@ def _loguru_quota_sink(message):
         raw_ab = text.split("Account abuse status:", 1)[1].strip()
         abuse_status_store = "✅ Чистый (Clean)" if "Clean" in raw_ab else raw_ab
 
-if hasattr(_gw_client, "logger") and not getattr(_gw_client, "_sink_v40", False):
+if hasattr(_gw_client, "logger") and not getattr(_gw_client, "_sink_v41", False):
     try:
         _gw_client.logger.add(_loguru_quota_sink)
-        _gw_client._sink_v40 = True
+        _gw_client._sink_v41 = True
     except Exception:
         pass
 
@@ -1167,7 +1174,7 @@ def create_dispatcher(bot_inst: Bot):
     return d
 
 @st.cache_resource
-def launch_bot_v40():
+def launch_bot_v41():
     gen_id = time.time()
     sys._active_tg_gen = gen_id
     old_state = getattr(sys, "_active_tg_bot", None)
@@ -1175,7 +1182,7 @@ def launch_bot_v40():
         try:
             asyncio.run_coroutine_threadsafe(old_state[1].stop_polling(), old_state[0])
             if len(old_state) > 2 and old_state[2] is not None:
-                asyncio.run_coroutine_threadsafe(old_state[2].session.close(), old_state[0])
+                asyncio.run_coroutine_threadsafe(old_state[2].session.close(), old_loop)
         except Exception:
             pass
         time.sleep(1.5)
@@ -1199,7 +1206,7 @@ def launch_bot_v40():
     t.start()
     return t
 
-launch_bot_v40()
+launch_bot_v41()
 
 st.title("Gemini Bot")
 st.success("Активен (@targetturtle)")

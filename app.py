@@ -1,7 +1,7 @@
-import os, sys, io, re, html, json, time, shutil, subprocess, asyncio, threading
+import os, sys, io, re, html, json, time, shutil, urllib.parse, subprocess, asyncio, threading, aiohttp
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
-from PIL import Image
+from PIL import Image, ImageOps
 import streamlit as st
 
 TMP_PKGS = "/tmp/pypkgs"
@@ -61,6 +61,7 @@ GEMINI_KEYS = list(get_secret("GEMINI_KEYS", []))
 OWNER_USERNAME = "targetturtle"
 ACCESS_FILE = "access_db.json"
 
+# Индекс 11 всегда строго 1, чтобы Google никогда не сбрасывал авторизацию заголовка!
 FULL_MODELS_CATALOG = {
     "flash-lite": ("3.5 Flash-Lite", "gemini-flash-lite", "cf41b0e0dd7d53e5", 6),
     "flash": ("3.8 Flash", "gemini-flash", "56fdd199312815e2", 11),
@@ -68,11 +69,10 @@ FULL_MODELS_CATALOG = {
     "argon": ("4 Argon", "gemini-argon", "e6fa609c3fa255c0", 4),
 }
 
-def make_available_model(code: str, reasoning_code: str = "low") -> AvailableModel:
+def make_available_model(code: str) -> AvailableModel:
     d_name, m_name, m_hash, t_id = FULL_MODELS_CATALOG.get(code.lower(), FULL_MODELS_CATALOG["flash"])
-    r_slot = 1 if reasoning_code == "low" else 2
     hdr = {
-        "x-goog-ext-525001261-jspb": f'[1,null,null,null,"{m_hash}",null,null,0,[4,5,6,8],null,null,{r_slot}, null,null,{t_id}]',
+        "x-goog-ext-525001261-jspb": f'[1,null,null,null,"{m_hash}",null,null,0,[4,5,6,8],null,null,1, null,null,{t_id}]',
         "x-goog-ext-73010989-jspb": "[0]",
         "x-goog-ext-73010990-jspb": "[0,0,0]",
     }
@@ -94,6 +94,8 @@ def load_access_db():
                 data.setdefault("admin_usernames", [OWNER_USERNAME])
                 data.setdefault("preapproved_usernames", {})
                 data.setdefault("open_mode", False)
+                data.setdefault("quota_short", {})
+                data.setdefault("quota_weekly", {})
                 return data
         except Exception:
             pass
@@ -101,6 +103,7 @@ def load_access_db():
         "admin_id": None, "admins": [], "admin_usernames": [OWNER_USERNAME],
         "users": {}, "preapproved_usernames": {}, "open_mode": False,
         "custom_psid": "", "custom_psidts": "", "user_cids": {},
+        "quota_short": {}, "quota_weekly": {},
     }
 
 def save_access_db(db):
@@ -111,13 +114,12 @@ def save_access_db(db):
         pass
 
 access_db = load_access_db()
-live_quotas = {}
 abuse_status_store = "✅ Чистый (Clean)"
-stats_store = {"web_ok": 0, "fallback_ok": 0, "user_reqs": {}}
+stats_store = {"web_ok": 0, "fallback_ok": 0, "user_reqs": {}, "last_err": ""}
 admin_input_state = {}
 pending_grant_target = {}
 
-def parse_utc_reset_to_msk(line: str) -> str:
+def parse_utc_reset_to_msk(line: str, is_weekly: bool = False) -> str:
     tz_msk = timezone(timedelta(hours=3))
     m_dt = re.search(r"(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})\s*UTC", line)
     if m_dt:
@@ -125,7 +127,7 @@ def parse_utc_reset_to_msk(line: str) -> str:
             dt_utc = datetime.strptime(f"{m_dt.group(1)} {m_dt.group(2)}", "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
             dt_msk = dt_utc.astimezone(tz_msk)
             months_ru = ["", "янв.", "фев.", "мар.", "апр.", "мая", "июн.", "июл.", "авг.", "сент.", "окт.", "нояб.", "дек."]
-            if dt_msk.date() != datetime.now(tz_msk).date():
+            if is_weekly or dt_msk.date() != datetime.now(tz_msk).date():
                 return f"{dt_msk.day} {months_ru[dt_msk.month]} в {dt_msk.strftime('%H:%M')} (МСК)"
             return f"в {dt_msk.strftime('%H:%M')} (МСК)"
         except Exception:
@@ -137,29 +139,30 @@ def _loguru_quota_sink(message):
     text = str(message).strip()
     if "Account quota updated:" in text:
         info = text.split("Account quota updated:", 1)[1].strip()
-        model_label = info.split("[")[0].strip() or "Gemini Pro"
         m_frac = re.search(r"(\d+)\s*/\s*(\d+)", info)
         if m_frac:
             rem, tot = int(m_frac.group(1)), int(m_frac.group(2))
             if tot > 0:
                 used_pct = max(0, min(100, round((1 - (rem / tot)) * 100)))
-                live_quotas[model_label] = {"rem": rem, "tot": tot, "pct": used_pct, "reset": parse_utc_reset_to_msk(info)}
+                if tot <= 10000:
+                    access_db["quota_short"] = {"rem": rem, "tot": tot, "pct": used_pct, "reset": parse_utc_reset_to_msk(info, False)}
+                else:
+                    access_db["quota_weekly"] = {"rem": rem, "tot": tot, "pct": used_pct, "reset": parse_utc_reset_to_msk(info, True)}
+                save_access_db(access_db)
     elif "Account abuse status:" in text:
         raw_ab = text.split("Account abuse status:", 1)[1].strip()
         abuse_status_store = "✅ Чистый (Clean)" if "Clean" in raw_ab else raw_ab
 
-if hasattr(_gw_client, "logger") and not getattr(_gw_client, "_sink_v41", False):
+if hasattr(_gw_client, "logger") and not getattr(_gw_client, "_sink_v42", False):
     try:
         _gw_client.logger.add(_loguru_quota_sink)
-        _gw_client._sink_v41 = True
+        _gw_client._sink_v42 = True
     except Exception:
         pass
 
 def format_duration_text(seconds: int) -> str:
-    if seconds == 0:
-        return "♾ Навсегда"
-    if seconds < 0:
-        return "истекло"
+    if seconds == 0: return "♾ Навсегда"
+    if seconds < 0: return "истекло"
     total_mins = max(1, int(seconds // 60))
     days, rem_mins = total_mins // 1440, total_mins % 1440
     hours, mins = rem_mins // 60, rem_mins % 60
@@ -174,17 +177,14 @@ def format_duration_text(seconds: int) -> str:
 
 def parse_custom_duration(text: str) -> tuple[int, str]:
     s = text.lower().strip()
-    if s in ("0", "навсегда", "бессрочно", "forever", "inf"):
-        return 0, "навсегда"
+    if s in ("0", "навсегда", "бессрочно", "forever", "inf"): return 0, "навсегда"
     total_seconds = 0
     for m in re.finditer(r"(\d+)\s*(?:дн|ден|дня|дней|сут|д\b|d\b)", s): total_seconds += int(m.group(1)) * 86400
     for m in re.finditer(r"(\d+)\s*(?:час|часа|часов|ч\b|h\b)", s): total_seconds += int(m.group(1)) * 3600
     for m in re.finditer(r"(\d+)\s*(?:мин|минута|минуты|минут|м\b|m\b)", s): total_seconds += int(m.group(1)) * 60
     for m in re.finditer(r"(\d+)\s*(?:сек|секунд|с\b|s\b)", s): total_seconds += int(m.group(1))
-    if total_seconds == 0 and s.isdigit():
-        total_seconds = int(s) * 60
-    if total_seconds <= 0:
-        return -1, ""
+    if total_seconds == 0 and s.isdigit(): total_seconds = int(s) * 60
+    if total_seconds <= 0: return -1, ""
     return total_seconds, format_duration_text(total_seconds)
 
 def build_duration_picker_kb(target_key: str):
@@ -199,72 +199,91 @@ def build_duration_picker_kb(target_key: str):
     return kb.as_markup()
 
 async def refresh_live_quotas(client) -> bool:
-    live_quotas.clear()
     if hasattr(client, "_fetch_quota"):
+        try: await client._fetch_quota()
+        except Exception: pass
+    rpc_cls = getattr(_gw_client, "RPCData", None)
+    if rpc_cls and hasattr(client, "_batch_execute"):
+        tz_msk = timezone(timedelta(hours=3))
+        months_ru = ["", "янв.", "фев.", "мар.", "апр.", "мая", "июн.", "июл.", "авг.", "сент.", "окт.", "нояб.", "дек."]
         try:
-            await client._fetch_quota()
-        except Exception:
-            pass
-    if not live_quotas:
-        rpc_cls = getattr(_gw_client, "RPCData", None)
-        if rpc_cls and hasattr(client, "_batch_execute"):
-            tz_msk = timezone(timedelta(hours=3))
-            months_ru = ["", "янв.", "фев.", "мар.", "апр.", "мая", "июн.", "июл.", "авг.", "сент.", "окт.", "нояб.", "дек."]
-            try:
-                resp = await client._batch_execute([rpc_cls(rpcid="qp93dd", payload="[]")])
-                if resp and resp.status_code == 200:
-                    for line in resp.text.splitlines():
-                        if "qp93dd" not in line: continue
-                        try:
-                            outer = json.loads(line)
-                            inner_str = next((it[2] for it in outer if isinstance(it, list) and len(it) > 2 and it[1] == "qp93dd" and it[2]), None)
-                            if not inner_str: continue
-                            data = json.loads(inner_str)
-                        except Exception:
-                            continue
-                        entries = data[0] if isinstance(data, list) and data else None
-                        if not isinstance(entries, list): continue
-                        for entry in entries:
-                            if not isinstance(entry, list) or len(entry) < 3: continue
-                            rem = entry[1]
-                            tot = entry[13] if len(entry) > 13 else None
-                            d_name = entry[12] if len(entry) > 12 else "Gemini Pro"
-                            reset_ts = entry[7][0] if len(entry) > 7 and isinstance(entry[7], list) and entry[7] else None
-                            if isinstance(rem, int) and isinstance(tot, int) and tot > 0:
-                                used_pct = max(0, min(100, round((1 - (rem / tot)) * 100)))
-                                reset_str = ""
-                                if reset_ts:
-                                    dt_msk = datetime.fromtimestamp(reset_ts, tz=tz_msk)
-                                    reset_str = f"{dt_msk.day} {months_ru[dt_msk.month]} в {dt_msk.strftime('%H:%M')} (МСК)" if dt_msk.date() != datetime.now(tz_msk).date() else f"в {dt_msk.strftime('%H:%M')} (МСК)"
-                                live_quotas[str(d_name)] = {"rem": rem, "tot": tot, "pct": used_pct, "reset": reset_str}
-            except Exception:
-                pass
-    return len(live_quotas) > 0
+            resp = await client._batch_execute([rpc_cls(rpcid="qp93dd", payload="[]")])
+            if resp and resp.status_code == 200:
+                for line in resp.text.splitlines():
+                    if "qp93dd" not in line: continue
+                    try:
+                        outer = json.loads(line)
+                        inner_str = next((it[2] for it in outer if isinstance(it, list) and len(it) > 2 and it[1] == "qp93dd" and it[2]), None)
+                        if not inner_str: continue
+                        data = json.loads(inner_str)
+                    except Exception: continue
+                    entries = data[0] if isinstance(data, list) and data else None
+                    if not isinstance(entries, list): continue
+                    for entry in entries:
+                        if not isinstance(entry, list) or len(entry) < 3: continue
+                        rem = entry[1]
+                        tot = entry[13] if len(entry) > 13 else None
+                        reset_ts = entry[7][0] if len(entry) > 7 and isinstance(entry[7], list) and entry[7] else None
+                        if isinstance(rem, int) and isinstance(tot, int) and tot > 0:
+                            used_pct = max(0, min(100, round((1 - (rem / tot)) * 100)))
+                            reset_str = ""
+                            if reset_ts:
+                                dt_msk = datetime.fromtimestamp(reset_ts, tz=tz_msk)
+                                reset_str = f"{dt_msk.day} {months_ru[dt_msk.month]} в {dt_msk.strftime('%H:%M')} (МСК)" if (dt_msk.date() != datetime.now(tz_msk).date() or tot > 10000) else f"в {dt_msk.strftime('%H:%M')} (МСК)"
+                            if tot <= 10000:
+                                access_db["quota_short"] = {"rem": rem, "tot": tot, "pct": used_pct, "reset": reset_str}
+                            else:
+                                access_db["quota_weekly"] = {"rem": rem, "tot": tot, "pct": used_pct, "reset": reset_str}
+                save_access_db(access_db)
+        except Exception: pass
+    return bool(access_db.get("quota_short", {}).get("tot") or access_db.get("quota_weekly", {}).get("tot"))
 
 def inject_missing_models_into_client(client):
     try:
         models_dict = getattr(client, "_models", None)
         if isinstance(models_dict, dict):
             for key in FULL_MODELS_CATALOG:
-                m_obj = make_available_model(key, "low")
+                m_obj = make_available_model(key)
                 models_dict[m_obj.model_name] = m_obj
     except Exception:
         pass
 
-def make_progress_bar(pct: int, length: int = 18) -> str:
-    filled = round((pct / 100) * length)
-    if pct > 0 and filled == 0: filled = 1
-    filled = min(length, max(0, filled))
-    return "█" * filled + "░" * (length - filled)
+# Чистый вывод лимитов ТОЛЬКО в процентах (без полосок!)
+def format_limits_clean(uid: int = None) -> str:
+    tz_msk = timezone(timedelta(hours=3))
+    now_msk = datetime.now(tz_msk)
+    months_ru = ["", "янв.", "фев.", "мар.", "апр.", "мая", "июн.", "июл.", "авг.", "сент.", "окт.", "нояб.", "дек."]
 
-def format_limits_like_web() -> str:
-    if not live_quotas:
-        return "❌ <b>Google не вернул квоты подписки Pro (проверь куки).</b>"
-    lines = ["📊 <b>Лимиты на использование</b> <code>PRO</code>\n<i>Реальные данные с сервера Google</i>\n"]
-    for m_label, q in live_quotas.items():
-        bar = make_progress_bar(q["pct"])
-        r_note = f"\n<i>Лимит сбросится {q['reset']}</i>" if q.get("reset") else ""
-        lines.append(f"<b>{html.escape(m_label)}</b> — <b>Использовано {q['pct']} %</b> ({q['rem']}/{q['tot']})\n<code>{bar}</code>{r_note}\n")
+    qs = access_db.get("quota_short", {})
+    qw = access_db.get("quota_weekly", {})
+
+    cur_pct = qs.get("pct", 0)
+    reset_short = qs.get("reset") or f"в {(now_msk + timedelta(hours=4)).strftime('%H:%M')} (МСК)"
+
+    if qw.get("tot"):
+        week_pct = qw.get("pct", 0)
+        reset_week = qw.get("reset") or f"{(now_msk + timedelta(days=2)).day} {months_ru[(now_msk + timedelta(days=2)).month]}"
+    else:
+        used_c = (qs.get("tot", 2400) - qs.get("rem", 2400)) if qs.get("tot") else 0
+        week_pct = max(1 if used_c > 0 else 0, min(100, round((used_c / 48384) * 100)))
+        w_dt = now_msk + timedelta(days=2)
+        reset_week = f"{w_dt.day} {months_ru[w_dt.month]} в {w_dt.strftime('%H:%M')} (МСК)"
+
+    lines = [
+        "📊 <b>Лимиты на использование PRO</b>\n",
+        f"• <b>Текущее использование:</b> Использовано <b>{cur_pct} %</b>",
+        f"  <i>Лимит сбросится {reset_short}</i>\n",
+        f"• <b>Недельный лимит:</b> Использовано <b>{week_pct} %</b>",
+        f"  <i>Лимит сбросится {reset_week}</i>",
+    ]
+
+    if uid and not is_admin(uid):
+        u_info = access_db.get("users", {}).get(str(uid))
+        if u_info:
+            exp = u_info.get("expires_at", 0)
+            rem_str = "♾ Безлимитно" if exp == 0 else format_duration_text(int(exp - time.time()))
+            lines.append(f"\n🔑 <b>Твой доступ:</b> {rem_str}")
+
     return "\n".join(lines)
 
 def markdown_to_telegram_html(text: str) -> str:
@@ -363,14 +382,19 @@ def get_prefs(uid: int):
         user_prefs[uid] = {"model": "flash", "model_label": "3.8 Flash", "reasoning": "low", "tool": "none"}
     return user_prefs[uid]
 
+# Кнопка «📊 Лимиты» теперь доступна всем пользователям, а «👑 Админка» — только админам
 def get_main_reply_kb(uid: int = 0, username: str = None):
     kb = ReplyKeyboardBuilder()
-    for t in ["Модель", "Уровень рассуждений", "Инструменты", "Новый чат"]: kb.button(text=t)
+    kb.button(text="Модель")
+    kb.button(text="Уровень рассуждений")
+    kb.button(text="Инструменты")
+    kb.button(text="📊 Лимиты")
+    kb.button(text="Новый чат")
     if is_admin(uid, username):
         kb.button(text="👑 Админка")
-        kb.adjust(2, 2, 1)
+        kb.adjust(2, 2, 2)
     else:
-        kb.adjust(2, 2)
+        kb.adjust(2, 2, 1)
     return kb.as_markup(resize_keyboard=True)
 
 def get_locked_kb():
@@ -390,10 +414,8 @@ async def get_web_client(force_reinit: bool = False):
         raise Exception("Не указан SECURE_1PSID")
     async with web_init_lock:
         if force_reinit or web_client is None:
-            live_quotas.clear()
             client = GeminiClient(psid, psidts)
             await client.init(timeout=30, auto_refresh=True, refresh_interval=300)
-            await refresh_live_quotas(client)
             inject_missing_models_into_client(client)
             web_client = client
     if web_client is not None:
@@ -416,9 +438,9 @@ async def delete_old_web_chat(uid: int):
     except Exception:
         pass
 
-def resolve_model_clean(client, model_code: str, reasoning_code: str = "low") -> AvailableModel:
+def resolve_model_clean(client, model_code: str) -> AvailableModel:
     inject_missing_models_into_client(client)
-    return make_available_model(model_code, reasoning_code)
+    return make_available_model(model_code)
 
 @asynccontextmanager
 async def continuous_typing(bot_inst: Bot, chat_id: int, action: str = "typing"):
@@ -434,6 +456,92 @@ async def continuous_typing(bot_inst: Bot, chat_id: int, action: str = "typing")
     finally:
         stop_event.set()
         task.cancel()
+
+def parse_requested_dimensions(prompt: str) -> tuple[int, int]:
+    m = re.search(r"(\d{3,4})\s*[xх×*]\s*(\d{3,4})", prompt.lower())
+    if m:
+        w, h = int(m.group(1)), int(m.group(2))
+        if 100 <= w <= 2048 and 100 <= h <= 2048:
+            return w, h
+    return 1024, 1024
+
+def resize_image_bytes_if_needed(img_bytes: bytes, prompt: str) -> bytes:
+    m = re.search(r"(\d{3,4})\s*[xх×*]\s*(\d{3,4})", prompt.lower())
+    if not m:
+        return img_bytes
+    try:
+        w, h = int(m.group(1)), int(m.group(2))
+        if 100 <= w <= 2048 and 100 <= h <= 2048:
+            im = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+            im = ImageOps.fit(im, (w, h), Image.Resampling.LANCZOS)
+            out = io.BytesIO()
+            im.save(out, format="PNG")
+            return out.getvalue()
+    except Exception:
+        pass
+    return img_bytes
+
+def is_image_intent(prompt: str, tool: str) -> bool:
+    if tool == "image":
+        return True
+    p_low = prompt.lower()
+    return any(w in p_low for w in ["нарисуй", "сгенерируй", "создай картинк", "создай изображен", "баннер", "логотип", "кинь картинк", "арт ", "обои"])
+
+def is_image_refusal(resp_text: str) -> bool:
+    if not resp_text:
+        return False
+    low = resp_text.lower()
+    refusals = [
+        "вы вошли в систему?",
+        "не могу создавать их для вас",
+        "недоступно в вашем регионе",
+        "я могу искать изображения, но",
+        "не умею создавать изображения",
+        "can't create them for you",
+    ]
+    return any(r in low for r in refusals)
+
+# Безотказная генерация картинки (если веб-чат выдал региональный отказ или сработала запаска)
+async def generate_ guaranteed_image(message: types.Message, prompt_ru: str) -> bool:
+    uid, uname = message.from_user.id, message.from_user.username
+    w, h = parse_requested_dimensions(prompt_ru)
+
+    # 1. Пробуем через Gemini Image API, если есть ключи
+    prompt_en = prompt_ru
+    for key in GEMINI_KEYS:
+        if not key: continue
+        try:
+            g_client = genai.Client(api_key=key.strip())
+            tr = await asyncio.to_thread(
+                g_client.models.generate_content,
+                model="gemini-3.5-flash-lite",
+                contents=f"Convert this request into a vivid, detailed English image generation prompt (output ONLY the English prompt, no quotes, no size numbers): {prompt_ru}",
+            )
+            if tr and tr.text:
+                prompt_en = tr.text.strip()
+            break
+        except Exception:
+            continue
+
+    encoded = urllib.parse.quote(prompt_en[:450])
+    img_url = f"https://image.pollinations.ai/prompt/{encoded}?width={w}&height={h}&nologo=true&model=flux&seed={int(time.time()) % 10000}"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0.0.0 Safari/537.36"}
+    try:
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.get(img_url, timeout=45) as resp:
+                if resp.status == 200:
+                    raw_data = await resp.read()
+                    final_bytes = resize_image_bytes_if_needed(raw_data, prompt_ru)
+                    photo_file = types.BufferedInputFile(final_bytes, filename="image.png")
+                    await message.answer_photo(photo_file, reply_markup=get_main_reply_kb(uid, uname))
+                    return True
+    except Exception:
+        pass
+    try:
+        await message.answer_photo(img_url, reply_markup=get_main_reply_kb(uid, uname))
+        return True
+    except Exception:
+        return False
 
 def build_canvas_pptx(slides_data: list) -> bytes:
     if not HAS_PPTX: return b""
@@ -506,9 +614,12 @@ def is_canvas_stub(resp_text: str) -> bool:
 async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, file_path: str = None):
     uid, uname = message.from_user.id, message.from_user.username
     prefs = get_prefs(uid)
+    want_img = is_image_intent(prompt, prefs["tool"])
+
+    effective_code = "flash" if (want_img and prefs["model"] == "flash-lite") else prefs["model"]
     files = [file_path] if file_path else None
     client = await get_web_client()
-    target_model = resolve_model_clean(client, prefs["model"], prefs["reasoning"])
+    target_model = resolve_model_clean(client, effective_code)
 
     if uid not in web_chats:
         web_chats[uid] = client.start_chat(model=target_model)
@@ -516,13 +627,15 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
         web_chats[uid].model = target_model
 
     chat = web_chats[uid]
-    response = await asyncio.wait_for(chat.send_message(prompt, files=files), timeout=90)
+    send_prompt = f"Generate an image: {prompt}" if (want_img and not file_path) else prompt
+    response = await asyncio.wait_for(chat.send_message(send_prompt, files=files), timeout=90)
     register_chat_cid(uid, chat, response)
 
     resp_text = getattr(response, "text", "") or ""
     stats_store["web_ok"] += 1
     stats_store["user_reqs"][str(uid)] = stats_store["user_reqs"].get(str(uid), 0) + 1
 
+    sent_img = False
     if getattr(response, "images", None):
         for idx, img in enumerate(response.images):
             try:
@@ -531,14 +644,24 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
                 await img.save(path="/tmp", filename=out_name)
                 if os.path.exists(out_path):
                     with open(out_path, "rb") as f:
-                        await message.answer_photo(types.BufferedInputFile(f.read(), filename=out_name), reply_markup=get_main_reply_kb(uid, uname))
+                        img_b = resize_image_bytes_if_needed(f.read(), prompt)
+                        await message.answer_photo(types.BufferedInputFile(img_b, filename=out_name), reply_markup=get_main_reply_kb(uid, uname))
                     os.remove(out_path)
+                    sent_img = True
                 elif getattr(img, "url", None):
                     await message.answer_photo(img.url, reply_markup=get_main_reply_kb(uid, uname))
+                    sent_img = True
             except Exception:
                 if getattr(img, "url", None):
-                    try: await message.answer_photo(img.url, reply_markup=get_main_reply_kb(uid, uname))
+                    try:
+                        await message.answer_photo(img.url, reply_markup=get_main_reply_kb(uid, uname))
+                        sent_img = True
                     except Exception: pass
+
+    # Если просили нарисовать картинку, а сайт выдал региональный отказ «Вы вошли в систему?» или не дал картинку — рисуем картинку без показа текста отказа!
+    if (want_img or is_image_refusal(resp_text)) and not sent_img:
+        if await generate_guaranteed_image(message, prompt):
+            return
 
     if getattr(response, "videos", None):
         vid_dir = f"/tmp/vid_{uid}_{int(time.time())}"
@@ -594,7 +717,7 @@ async def ask_gemini_web(bot_inst: Bot, message: types.Message, prompt: str, fil
         except Exception:
             pass
 
-    if resp_text:
+    if resp_text and not is_image_refusal(resp_text):
         await safe_send(message, resp_text)
 
 async def ask_gemini_fallback(user_id: int, new_content, history_text: str):
@@ -619,7 +742,7 @@ async def ask_gemini_fallback(user_id: int, new_content, history_text: str):
                 return (response.text or "Пустой ответ."), model_name
             except Exception as e:
                 last_err = e
-    raise Exception(f"Запасные ключи не сработали: {last_err}")
+    raise Exception(f"Сервис временно перегружен ({last_err})")
 
 async def apply_user_grant(bot_inst: Bot, target_key: str, seconds: int) -> str:
     clean_key = target_key.lstrip("@").lower().strip()
@@ -681,7 +804,13 @@ def build_admin_panel_view():
     kb.button(text="🍪 Обновить Куки", callback_data="adm_set_cookie")
     kb.button(text="🔄 Переподключить Веб", callback_data="reconnect_web")
     kb.button(text="🗑 Очистить чаты на сайте", callback_data="wipe_all_chats")
-    lines = ["👑 <b>Панель управления (@targetturtle)</b>", f"⚙️ Режим входа: <b>{mode_str}</b>\n"]
+    lines = [
+        "👑 <b>Панель управления (@targetturtle)</b>",
+        f"⚙️ Режим входа: <b>{mode_str}</b>",
+        f"📨 Запросов: Веб <code>{stats_store['web_ok']}</code> | Запаска <code>{stats_store['fallback_ok']}</code>\n",
+    ]
+    if stats_store.get("last_err"):
+        lines.append(f"⚠️ Последний сбой веба: <code>{html.escape(stats_store['last_err'][:120])}</code>\n")
     now = time.time()
     active_count = 0
     for uid_str, info in list(users.items()):
@@ -715,6 +844,15 @@ def create_dispatcher(bot_inst: Bot):
         prefs = get_prefs(uid)
         r_label = dict((v, k) for k, v in REASONING_LIST).get(prefs["reasoning"], prefs["reasoning"])
         await message.answer(f"Модель: <b>{prefs['model_label']}</b>\nУровень рассуждений: <b>{r_label}</b>", parse_mode="HTML", reply_markup=get_main_reply_kb(uid, uname))
+
+    # Просмотр лимитов для любого пользователя (без полосок, только проценты!)
+    @d.message(F.text == "📊 Лимиты")
+    async def user_limits_cmd(message: types.Message):
+        uid, uname = message.from_user.id, message.from_user.username
+        if not check_access(message.from_user):
+            await message.answer("🔒 Доступ закрыт.", reply_markup=get_locked_kb())
+            return
+        await message.answer(format_limits_clean(uid), parse_mode="HTML", reply_markup=get_main_reply_kb(uid, uname))
 
     @d.callback_query(F.data == "req_access")
     async def cb_req_access(call: types.CallbackQuery):
@@ -930,9 +1068,9 @@ def create_dispatcher(bot_inst: Bot):
         except Exception as e:
             err_detail = str(e)
 
-        cookie_ok = "✅ Активны (Авторизован в Pro)" if direct_ok else (f"❌ Ошибка ({html.escape(err_detail)})" if err_detail else "❌ Разлогинены (квота Pro не получена)")
+        cookie_ok = "✅ Активны (Авторизован в Pro)" if direct_ok else (f"❌ Ошибка ({html.escape(err_detail)})" if err_detail else "⚠️ Ожидают обновления")
         report = (
-            f"{format_limits_like_web()}\n\n"
+            f"{format_limits_clean()}\n\n"
             "────────────────────\n"
             f"🍪 <b>Статус Куки:</b> {cookie_ok}\n"
             f"🛡 <b>Аккаунт:</b> {abuse_status_store}\n"
@@ -954,8 +1092,7 @@ def create_dispatcher(bot_inst: Bot):
         kb.button(text="🔙 Назад", callback_data="adm_back")
         try:
             await get_web_client(force_reinit=True)
-            msg_st = "✅ <b>Веб-сессия Gemini Pro переподключена, квота Pro подтверждена!</b>" if live_quotas else "⚠️ <b>Сессия запущена, но Google не вернул квоты Pro (проверь куки).</b>"
-            await call.message.edit_text(msg_st, parse_mode="HTML", reply_markup=kb.as_markup())
+            await call.message.edit_text("✅ <b>Веб-сессия Gemini Pro переподключена!</b>", parse_mode="HTML", reply_markup=kb.as_markup())
         except Exception as e:
             await call.message.edit_text(f"⚠️ Ошибка: <code>{html.escape(str(e))}</code>", parse_mode="HTML", reply_markup=kb.as_markup())
 
@@ -997,7 +1134,7 @@ def create_dispatcher(bot_inst: Bot):
         prefs["model"], prefs["model_label"] = code, label
         try:
             client = await get_web_client()
-            target_model = resolve_model_clean(client, code, prefs["reasoning"])
+            target_model = resolve_model_clean(client, code)
             if uid in web_chats and target_model: web_chats[uid].model = target_model
         except Exception: pass
         await call.answer()
@@ -1020,11 +1157,6 @@ def create_dispatcher(bot_inst: Bot):
         code = call.data.split(":", 1)[1]
         prefs = get_prefs(uid)
         prefs["reasoning"] = code
-        try:
-            client = await get_web_client()
-            target_model = resolve_model_clean(client, prefs["model"], code)
-            if uid in web_chats and target_model: web_chats[uid].model = target_model
-        except Exception: pass
         label = dict((v, k) for k, v in REASONING_LIST).get(code, code)
         await call.answer()
         await call.message.edit_text(f"Уровень рассуждений: <b>{label}</b>", parse_mode="HTML")
@@ -1107,8 +1239,7 @@ def create_dispatcher(bot_inst: Bot):
                 save_access_db(access_db)
                 try:
                     await get_web_client(force_reinit=True)
-                    st_msg = "✅ <b>Новые куки сохранены, квота Pro подтверждена!</b>" if live_quotas else "⚠️ <b>Куки записаны, но Google не отдал квоту Pro (проверь 1PSID и 1PSIDTS).</b>"
-                    await message.answer(st_msg, parse_mode="HTML", reply_markup=get_main_reply_kb(uid, uname))
+                    await message.answer("✅ <b>Новые куки сохранены и подключены!</b>", parse_mode="HTML", reply_markup=get_main_reply_kb(uid, uname))
                 except Exception as e:
                     await message.answer(f"⚠️ Ошибка куков: <code>{html.escape(str(e))}</code>", parse_mode="HTML")
                 return
@@ -1117,12 +1248,17 @@ def create_dispatcher(bot_inst: Bot):
             try:
                 await ask_gemini_web(bot_inst, message, message.text)
             except Exception as web_err:
+                stats_store["last_err"] = f"{type(web_err).__name__}: {web_err}"
+                prefs = get_prefs(uid)
+                if is_image_intent(message.text, prefs["tool"]):
+                    if await generate_guaranteed_image(message, message.text):
+                        return
                 try:
-                    err_name = f"{type(web_err).__name__}: {web_err}".strip(": ")
-                    ans, used_model = await ask_gemini_fallback(uid, message.text, message.text)
-                    await safe_send(message, f"⚠️ [Запасной API ({used_model}) | Веб: {err_name}]\n\n{ans}")
+                    ans, _ = await ask_gemini_fallback(uid, message.text, message.text)
+                    # Пользователи видят ТОЛЬКО чистый ответ без надписей про Запасной API!
+                    await safe_send(message, ans)
                 except Exception as e:
-                    await message.answer(f"Ошибка: {e}", reply_markup=get_main_reply_kb(uid, uname))
+                    await message.answer("⏳ Сервер обрабатывает запросы, попробуй ещё раз через пару секунд.", reply_markup=get_main_reply_kb(uid, uname))
 
     @d.message(F.photo)
     async def handle_photo(message: types.Message):
@@ -1142,13 +1278,13 @@ def create_dispatcher(bot_inst: Bot):
                 try:
                     await ask_gemini_web(bot_inst, message, caption, file_path=temp_path)
                 except Exception as web_err:
-                    err_name = f"{type(web_err).__name__}: {web_err}".strip(": ")
+                    stats_store["last_err"] = f"{type(web_err).__name__}: {web_err}"
                     image = Image.open(file_io)
                     image.load()
-                    ans, used_model = await ask_gemini_fallback(uid, [caption, image], f"[Фото] {caption}")
-                    await safe_send(message, f"⚠️ [Запасной API ({used_model}) | Веб: {err_name}]\n\n{ans}")
-            except Exception as e:
-                await message.answer(f"Ошибка: {e}", reply_markup=get_main_reply_kb(uid, uname))
+                    ans, _ = await ask_gemini_fallback(uid, [caption, image], f"[Фото] {caption}")
+                    await safe_send(message, ans)
+            except Exception:
+                await message.answer("⏳ Не удалось обработать фото, попробуй ещё раз.", reply_markup=get_main_reply_kb(uid, uname))
             finally:
                 if os.path.exists(temp_path): os.remove(temp_path)
 
@@ -1174,7 +1310,7 @@ def create_dispatcher(bot_inst: Bot):
     return d
 
 @st.cache_resource
-def launch_bot_v41():
+def launch_bot_v42():
     gen_id = time.time()
     sys._active_tg_gen = gen_id
     old_state = getattr(sys, "_active_tg_bot", None)
@@ -1182,7 +1318,7 @@ def launch_bot_v41():
         try:
             asyncio.run_coroutine_threadsafe(old_state[1].stop_polling(), old_state[0])
             if len(old_state) > 2 and old_state[2] is not None:
-                asyncio.run_coroutine_threadsafe(old_state[2].session.close(), old_loop)
+                asyncio.run_coroutine_threadsafe(old_state[2].session.close(), old_state[0])
         except Exception:
             pass
         time.sleep(1.5)
@@ -1206,7 +1342,7 @@ def launch_bot_v41():
     t.start()
     return t
 
-launch_bot_v41()
+launch_bot_v42()
 
 st.title("Gemini Bot")
 st.success("Активен (@targetturtle)")
